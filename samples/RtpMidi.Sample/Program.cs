@@ -14,6 +14,7 @@ using Haukcode.RtpMidi.Mdns;
 // Once connected the sample:
 //   • Prints every incoming MIDI message decoded to human-readable form
 //   • Lets you type simple commands to send MIDI back (for LED feedback testing)
+//   • Automatically reconnects if the session drops (Ctrl+C to quit)
 // ---------------------------------------------------------------------------
 
 const string LocalName = "RtpMidi-Sample";
@@ -62,12 +63,12 @@ static async Task RunDiscoveryAndConnectAsync()
 }
 
 // ---------------------------------------------------------------------------
-// Connect as initiator
+// Connect as initiator, with auto-reconnect
 // ---------------------------------------------------------------------------
 
 static async Task RunClientAsync(IPEndPoint controlEp)
 {
-    Console.WriteLine($"\nConnecting to {controlEp} …");
+    Console.WriteLine($"\nConnecting to {controlEp} (reconnects every 5 s on drop)…");
 
     await using var session = new RtpMidiSession(LocalName);
 
@@ -76,19 +77,21 @@ static async Task RunClientAsync(IPEndPoint controlEp)
     using var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-    await session.ConnectAsync(controlEp, cts.Token);
-    Console.WriteLine("Connected. Press Ctrl+C to quit.\n");
+    // Reconnect loop runs in the background; command loop runs in the foreground.
+    var connectTask = session.ConnectWithReconnectAsync(controlEp, TimeSpan.FromSeconds(5), cts.Token);
 
     await RunCommandLoopAsync(session, cts.Token);
+    await connectTask;
 }
 
 // ---------------------------------------------------------------------------
-// Listen for incoming connection (responder role)
+// Listen for incoming connection, with auto-reconnect
 // ---------------------------------------------------------------------------
 
 static async Task RunListenerAsync(int controlPort)
 {
-    Console.WriteLine($"\nListening on control port {controlPort} (data port {controlPort + 1}) …");
+    Console.WriteLine($"\nListening on control port {controlPort} (data port {controlPort + 1})…");
+    Console.WriteLine($"Will re-listen after each session ends. Press Ctrl+C to quit.\n");
 
     await using var session = new RtpMidiSession(LocalName);
 
@@ -97,19 +100,10 @@ static async Task RunListenerAsync(int controlPort)
     using var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-    try
-    {
-        await session.ListenAsync(controlPort, cts.Token);
-    }
-    catch (TimeoutException ex)
-    {
-        Console.WriteLine($"\nHandshake failed: {ex.Message}");
-        return;
-    }
-
-    Console.WriteLine($"Connected to '{session.RemoteName}'. Press Ctrl+C to quit.\n");
+    var listenTask = session.ListenWithReconnectAsync(controlPort, TimeSpan.FromMilliseconds(500), cts.Token);
 
     await RunCommandLoopAsync(session, cts.Token);
+    await listenTask;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +113,16 @@ static async Task RunListenerAsync(int controlPort)
 static void SubscribeToSession(IRtpMidiSession session)
 {
     session.StateChanges.Subscribe(state =>
-        Console.WriteLine($"[state] {state}"));
+    {
+        var label = state switch
+        {
+            SessionState.Connected     => $"Connected to '{session.RemoteName}'",
+            SessionState.Disconnecting => "Disconnecting…",
+            SessionState.Idle          => "Disconnected — waiting to reconnect…",
+            _                          => state.ToString(),
+        };
+        Console.WriteLine($"[state] {label}");
+    });
 
     session.MidiReceived.Subscribe(midiBytes =>
     {
@@ -194,7 +197,6 @@ static async Task RunCommandLoopAsync(IRtpMidiSession session, CancellationToken
 
                 case "sysex":
                     // sysex <hex bytes, space-separated, without F0/F7>
-                    // e.g.  sysex 47 7F 30 2C 01 00
                     if (parts.Length < 2) { Console.WriteLine("Usage: sysex <hex bytes>"); break; }
                     var bodyBytes = parts[1..].Select(h => Convert.ToByte(h, 16)).ToArray();
                     var sysex = new byte[bodyBytes.Length + 2];
@@ -226,6 +228,10 @@ static async Task RunCommandLoopAsync(IRtpMidiSession session, CancellationToken
                     break;
             }
         }
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine($"  (not connected — {ex.Message})");
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"Error: {ex.Message}");
@@ -245,7 +251,6 @@ static string DecodeMidi(ReadOnlySpan<byte> data)
 
     byte status = data[0];
 
-    // System messages
     if (status >= 0xF0)
     {
         return status switch
@@ -296,5 +301,6 @@ static void PrintHelp()
     quit / exit                   Disconnect and exit
 
   Incoming MIDI is printed automatically as it arrives.
+  Commands while disconnected are silently discarded.
 """);
 }

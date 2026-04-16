@@ -357,7 +357,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
             }
         }
         catch (OperationCanceledException) { }
-        catch (SocketException) { /* socket closed during shutdown */ }
+        catch (SocketException)
+        {
+            // If the socket died while we were still connected (not a planned shutdown),
+            // trigger a clean disconnect so reconnect logic can kick in.
+            if (State == SessionState.Connected)
+                _ = DisconnectAsync();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -463,6 +469,75 @@ public sealed class RtpMidiSession : IRtpMidiSession
         dataSocket?.Close();
         controlSocket = null;
         dataSocket = null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Reconnect loops
+    // -------------------------------------------------------------------------
+
+    /// <inheritdoc/>
+    public async Task ConnectWithReconnectAsync(IPEndPoint controlEndPoint, TimeSpan reconnectDelay, CancellationToken ct = default)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            // Subscribe before connecting so we cannot miss a rapid disconnect.
+            var sessionEndedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var sub = StateChanges
+                .Where(s => s == SessionState.Idle)
+                .Subscribe(_ => sessionEndedTcs.TrySetResult());
+
+            try
+            {
+                await ConnectAsync(controlEndPoint, ct);
+                // Wait until the session falls back to Idle (BY from remote, socket error, etc.)
+                await sessionEndedTcs.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                // Handshake failed or unexpected error — ensure clean state before retrying.
+                await DisconnectAsync();
+            }
+
+            if (ct.IsCancellationRequested) return;
+
+            try { await Task.Delay(reconnectDelay, ct); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task ListenWithReconnectAsync(int controlPort, TimeSpan reconnectDelay, CancellationToken ct = default)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var sessionEndedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var sub = StateChanges
+                .Where(s => s == SessionState.Idle)
+                .Subscribe(_ => sessionEndedTcs.TrySetResult());
+
+            try
+            {
+                await ListenAsync(controlPort, ct);
+                await sessionEndedTcs.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                await DisconnectAsync();
+            }
+
+            if (ct.IsCancellationRequested) return;
+
+            try { await Task.Delay(reconnectDelay, ct); }
+            catch (OperationCanceledException) { return; }
+        }
     }
 
     // -------------------------------------------------------------------------

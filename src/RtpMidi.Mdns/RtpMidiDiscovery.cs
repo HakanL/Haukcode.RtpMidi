@@ -1,7 +1,7 @@
 using System.Net;
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
-using Zeroconf;
+using Haukcode.Mdns;
 
 namespace Haukcode.RtpMidi.Mdns;
 
@@ -13,25 +13,25 @@ namespace Haukcode.RtpMidi.Mdns;
 /// </summary>
 public sealed class RtpMidiDiscovery : IDisposable
 {
-    private const string ServiceType = "_apple-midi._udp.local.";
+    private const string ServiceType = "_apple-midi._udp";
 
     private readonly Subject<RtpMidiPeer> foundSubject = new();
     private readonly Subject<RtpMidiPeer> lostSubject = new();
-    private readonly Dictionary<string, RtpMidiPeer> knownPeers = new();
-    private readonly object knownPeersLock = new();
-
-    private IDisposable? monitorSubscription;
+    private readonly MdnsBrowser browser;
     private bool disposed;
 
     /// <summary>Emits each peer the moment it is first discovered.</summary>
     public IObservable<RtpMidiPeer> PeersFound => foundSubject.AsObservable();
 
-    /// <summary>
-    /// Emits a peer when it disappears from subsequent scans.
-    /// Note: mDNS departure detection is inherently poll-based when using
-    /// ResolveContinuous; true goodbye packets require a lower-level listener.
-    /// </summary>
+    /// <summary>Emits a peer when its PTR TTL expires and it is not refreshed.</summary>
     public IObservable<RtpMidiPeer> PeersLost => lostSubject.AsObservable();
+
+    public RtpMidiDiscovery()
+    {
+        browser = new MdnsBrowser(ServiceType);
+        browser.ServiceFound += OnServiceFound;
+        browser.ServiceLost  += OnServiceLost;
+    }
 
     // -------------------------------------------------------------------------
     // One-shot resolve
@@ -44,12 +44,19 @@ public sealed class RtpMidiDiscovery : IDisposable
         TimeSpan? scanTime = null,
         CancellationToken ct = default)
     {
-        var hosts = await ZeroconfResolver.ResolveAsync(
-            ServiceType,
-            scanTime: scanTime ?? TimeSpan.FromSeconds(2),
-            cancellationToken: ct);
+        using var browser = new MdnsBrowser(ServiceType);
+        var found = new List<RtpMidiPeer>();
 
-        return hosts.SelectMany(ToPeers).ToList();
+        browser.ServiceFound += svc =>
+        {
+            lock (found)
+                found.Add(ToPeer(svc));
+        };
+
+        browser.Start();
+        await Task.Delay(scanTime ?? TimeSpan.FromSeconds(2), ct);
+
+        return found.ToList();
     }
 
     // -------------------------------------------------------------------------
@@ -58,50 +65,29 @@ public sealed class RtpMidiDiscovery : IDisposable
 
     /// <summary>
     /// Start continuous mDNS monitoring. <see cref="PeersFound"/> emits as new
-    /// devices appear. Call <see cref="Dispose"/> to stop.
+    /// devices appear; <see cref="PeersLost"/> emits when their TTL expires.
+    /// Call <see cref="Dispose"/> to stop.
     /// </summary>
-    public void StartMonitoring(TimeSpan? scanInterval = null)
+    public void StartMonitoring()
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-
-        monitorSubscription = ZeroconfResolver
-            .ResolveContinuous(ServiceType, scanTime: scanInterval ?? TimeSpan.FromSeconds(2))
-            .Subscribe(
-                onNext: OnHostSeen,
-                onError: _ => { /* surface via error observable in a future release */ },
-                onCompleted: () => { });
+        browser.Start();
     }
 
     // -------------------------------------------------------------------------
     // Internal
     // -------------------------------------------------------------------------
 
-    private void OnHostSeen(IZeroconfHost host)
-    {
-        foreach (var peer in ToPeers(host))
-        {
-            lock (knownPeersLock)
-            {
-                if (!knownPeers.ContainsKey(peer.Name))
-                {
-                    knownPeers[peer.Name] = peer;
-                    foundSubject.OnNext(peer);
-                }
-            }
-        }
-    }
+    private void OnServiceFound(ServiceProfile profile)
+        => foundSubject.OnNext(ToPeer(profile));
 
-    private static IEnumerable<RtpMidiPeer> ToPeers(IZeroconfHost host)
-    {
-        if (!IPAddress.TryParse(host.IPAddress, out var addr))
-            yield break;
+    private void OnServiceLost(ServiceProfile profile)
+        => lostSubject.OnNext(ToPeer(profile));
 
-        foreach (var svc in host.Services.Values)
-        {
-            var name = host.DisplayName ?? host.Id;
-            yield return new RtpMidiPeer(name, new IPEndPoint(addr, svc.Port));
-            break; // one peer per service entry
-        }
+    private static RtpMidiPeer ToPeer(ServiceProfile profile)
+    {
+        var address = profile.Address ?? IPAddress.Loopback;
+        return new RtpMidiPeer(profile.InstanceName, new IPEndPoint(address, profile.Port));
     }
 
     // -------------------------------------------------------------------------
@@ -113,7 +99,9 @@ public sealed class RtpMidiDiscovery : IDisposable
         if (disposed) return;
         disposed = true;
 
-        monitorSubscription?.Dispose();
+        browser.ServiceFound -= OnServiceFound;
+        browser.ServiceLost  -= OnServiceLost;
+        browser.Dispose();
 
         foundSubject.OnCompleted();
         foundSubject.Dispose();

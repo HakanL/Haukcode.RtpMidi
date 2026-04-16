@@ -9,14 +9,14 @@
     <!-- NuGet Metadata -->
     <PackageId>Haukcode.RtpMidi.Mdns</PackageId>
     <Version>0.99.99</Version>
-    <Title>RTP-MIDI mDNS Discovery for .NET</Title>
+    <Title>RTP-MIDI mDNS Discovery and Advertising for .NET</Title>
     <Authors>Hakan Lindestaf</Authors>
-    <Description>mDNS/Bonjour peer discovery for Haukcode.RtpMidi. Browses the local network for _apple-midi._udp services and exposes found/lost peers as IObservable streams.</Description>
+    <Description>mDNS/Bonjour peer discovery and advertising for Haukcode.RtpMidi. Browses the local network for _apple-midi._udp services and exposes found/lost peers as IObservable streams. Advertise your own session so other devices can find it.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Copyright>© Copyright 2026 Hakan Lindestaf</Copyright>
     <PackageProjectUrl>https://github.com/HakanL/Haukcode.RtpMidi</PackageProjectUrl>
     <RepositoryUrl>https://github.com/HakanL/Haukcode.RtpMidi</RepositoryUrl>
-    <PackageTags>midi rtp-midi network-midi apple-midi mdns bonjour zeroconf discovery</PackageTags>
+    <PackageTags>midi rtp-midi network-midi apple-midi mdns bonjour zeroconf discovery advertising</PackageTags>
     <PackageReadmeFile>README_NUGET_MDNS.md</PackageReadmeFile>
   </PropertyGroup>
 
@@ -25,7 +25,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Zeroconf" Version="3.7.16" />
+    <PackageReference Include="Haukcode.Mdns" Version="1.0.*" />
   </ItemGroup>
 
   <ItemGroup>

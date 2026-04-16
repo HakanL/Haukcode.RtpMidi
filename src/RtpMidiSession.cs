@@ -164,16 +164,26 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
         State = SessionState.ConnectingControl;
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(HandshakeTimeoutMs);
+        // Wait indefinitely for the peer to initiate — only ct (Ctrl+C) can cancel this.
+        remoteControlEp = await AcceptPortAsync(controlSocket, ct);
 
-        // Wait for IN on control port, reply OK
-        remoteControlEp = await AcceptPortAsync(controlSocket, timeoutCts.Token);
-
+        // Peer has started connecting. Now the data port IN should arrive promptly —
+        // apply a timeout to catch half-finished handshakes.
         State = SessionState.ConnectingData;
 
-        // Wait for IN on data port, reply OK
-        remoteDataEp = await AcceptPortAsync(dataSocket, timeoutCts.Token);
+        using var dataTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        dataTimeoutCts.CancelAfter(HandshakeTimeoutMs);
+
+        try
+        {
+            remoteDataEp = await AcceptPortAsync(dataSocket, dataTimeoutCts.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"RTP-MIDI data port handshake timed out waiting for IN on port {dataPort}. " +
+                $"Ensure UDP port {dataPort} is reachable (check firewall rules).");
+        }
 
         // Connect sockets so receive loops work symmetrically
         controlSocket.Connect(remoteControlEp);
@@ -211,10 +221,16 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (State == SessionState.Idle || State == SessionState.Disconnecting)
             return;
 
+        var wasConnected = State == SessionState.Connected;
         State = SessionState.Disconnecting;
 
-        await SendByAsync(controlSocket, remoteControlEp);
-        await SendByAsync(dataSocket,    remoteDataEp);
+        // Only send BY if we completed the full handshake — no point notifying
+        // the peer about a session that was never established.
+        if (wasConnected)
+        {
+            await SendByAsync(controlSocket, remoteControlEp);
+            await SendByAsync(dataSocket,    remoteDataEp);
+        }
 
         await StopLoopsAsync();
         CloseAndNullSockets();

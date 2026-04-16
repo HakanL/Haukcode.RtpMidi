@@ -97,7 +97,16 @@ static async Task RunListenerAsync(int controlPort)
     using var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-    await session.ListenAsync(controlPort, cts.Token);
+    try
+    {
+        await session.ListenAsync(controlPort, cts.Token);
+    }
+    catch (TimeoutException ex)
+    {
+        Console.WriteLine($"\nHandshake failed: {ex.Message}");
+        return;
+    }
+
     Console.WriteLine($"Connected to '{session.RemoteName}'. Press Ctrl+C to quit.\n");
 
     await RunCommandLoopAsync(session, cts.Token);

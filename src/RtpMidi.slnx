@@ -7,6 +7,9 @@
   <Folder Name="/tests/">
     <Project Path="../tests/RtpMidi.Tests/RtpMidi.Tests.csproj" />
   </Folder>
+  <Folder Name="/samples/">
+    <Project Path="../samples/RtpMidi.Sample/RtpMidi.Sample.csproj" />
+  </Folder>
   <Project Path="RtpMidi.csproj" />
   <Project Path="RtpMidi.Mdns/RtpMidi.Mdns.csproj" />
 </Solution>

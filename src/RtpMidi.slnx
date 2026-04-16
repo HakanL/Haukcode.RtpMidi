@@ -1,0 +1,12 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/tests/">
+    <Project Path="../tests/RtpMidi.Tests/RtpMidi.Tests.csproj" />
+  </Folder>
+  <Project Path="RtpMidi.csproj" />
+  <Project Path="RtpMidi.Mdns/RtpMidi.Mdns.csproj" />
+</Solution>

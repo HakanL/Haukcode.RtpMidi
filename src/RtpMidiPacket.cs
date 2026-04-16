@@ -1,0 +1,144 @@
+namespace Haukcode.RtpMidi;
+
+/// <summary>
+/// Parsed representation of an RTP-MIDI data packet (RFC 6295).
+///
+/// Wire format:
+///   [RTP header: 12 bytes]
+///   [MIDI command section header: 1-2 bytes]
+///   [MIDI commands: variable]
+///
+/// RTP header layout (network byte order):
+///   Byte 0:  V=2 P=0 X=0 CC=0  → 0x80
+///   Byte 1:  M(1) PT=97(7)     → 0x61 (or 0xE1 with marker bit)
+///   Bytes 2-3:  sequence number
+///   Bytes 4-7:  timestamp (100 µs units per Apple MIDI convention)
+///   Bytes 8-11: SSRC
+///
+/// MIDI command section header:
+///   If B=0 (short): 1 byte — [B=0][J=0][Z=0][P=0][len: 4 bits]
+///   If B=1 (long):  2 bytes — [B=1][J=0][Z=0][P=0][len hi: 4 bits][len lo: 8 bits]
+/// </summary>
+public sealed class RtpMidiPacket
+{
+    private const byte RtpVersion    = 0x80; // V=2, P=0, X=0, CC=0
+    private const byte PayloadType   = 97;
+    private const int  RtpHeaderSize = 12;
+
+    public ushort SequenceNumber { get; init; }
+    public uint Timestamp { get; init; }
+    public uint Ssrc { get; init; }
+
+    /// <summary>Raw MIDI bytes extracted from the MIDI command section.</summary>
+    public ReadOnlyMemory<byte> MidiBytes { get; init; }
+
+    // -------------------------------------------------------------------------
+    // Parse
+    // -------------------------------------------------------------------------
+
+    public static bool TryParse(ReadOnlySpan<byte> data, out RtpMidiPacket? packet)
+    {
+        packet = null;
+
+        if (data.Length < RtpHeaderSize + 1)
+            return false;
+
+        // Validate RTP header basics
+        if ((data[0] & 0xC0) != 0x80) // V must be 2
+            return false;
+
+        var pt = data[1] & 0x7F;
+        if (pt != PayloadType)
+            return false;
+
+        var seq  = BinaryPrimitives.ReadUInt16BigEndian(data[2..]);
+        var ts   = BinaryPrimitives.ReadUInt32BigEndian(data[4..]);
+        var ssrc = BinaryPrimitives.ReadUInt32BigEndian(data[8..]);
+
+        // Parse MIDI command section header
+        var section = data[RtpHeaderSize..];
+        if (section.IsEmpty)
+            return false;
+
+        bool longHeader = (section[0] & 0x80) != 0;
+        int midiLen;
+        int headerBytes;
+
+        if (longHeader)
+        {
+            if (section.Length < 2)
+                return false;
+            midiLen = ((section[0] & 0x0F) << 8) | section[1];
+            headerBytes = 2;
+        }
+        else
+        {
+            midiLen = section[0] & 0x0F;
+            headerBytes = 1;
+        }
+
+        if (section.Length < headerBytes + midiLen)
+            return false;
+
+        var midiBytes = section.Slice(headerBytes, midiLen).ToArray();
+
+        packet = new RtpMidiPacket
+        {
+            SequenceNumber = seq,
+            Timestamp = ts,
+            Ssrc = ssrc,
+            MidiBytes = midiBytes,
+        };
+
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Encode
+    // -------------------------------------------------------------------------
+
+    public static byte[] Encode(uint ssrc, ushort sequenceNumber, uint timestamp, ReadOnlySpan<byte> midiBytes)
+    {
+        bool longHeader = midiBytes.Length > 15;
+        int headerBytes = longHeader ? 2 : 1;
+        var buf = new byte[RtpHeaderSize + headerBytes + midiBytes.Length];
+
+        // RTP header
+        buf[0] = RtpVersion;
+        buf[1] = PayloadType;
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(2), sequenceNumber);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(4), timestamp);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(8), ssrc);
+
+        // MIDI command section header
+        if (longHeader)
+        {
+            buf[12] = (byte)(0x80 | ((midiBytes.Length >> 8) & 0x0F));
+            buf[13] = (byte)(midiBytes.Length & 0xFF);
+        }
+        else
+        {
+            buf[12] = (byte)(midiBytes.Length & 0x0F);
+        }
+
+        midiBytes.CopyTo(buf.AsSpan(RtpHeaderSize + headerBytes));
+
+        return buf;
+    }
+
+    // -------------------------------------------------------------------------
+    // Timestamp helpers
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Converts a <see cref="TimeSpan"/> to RTP-MIDI timestamp units (100 µs ticks).
+    /// </summary>
+    public static uint ToRtpTimestamp(TimeSpan elapsed)
+        => (uint)(elapsed.TotalMilliseconds * 10);
+
+    /// <summary>
+    /// Returns the current RTP timestamp relative to <paramref name="sessionStart"/>.
+    /// </summary>
+    public static uint CurrentTimestamp(DateTime sessionStart)
+        => ToRtpTimestamp(DateTime.UtcNow - sessionStart);
+}

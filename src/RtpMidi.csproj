@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Haukcode.RtpMidi</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+
+    <!-- NuGet Metadata -->
+    <PackageId>Haukcode.RtpMidi</PackageId>
+    <Version>0.99.99</Version>
+    <Title>RTP-MIDI for .NET</Title>
+    <Authors>Hakan Lindestaf</Authors>
+    <Description>RTP-MIDI (RFC 6295) implementation in modern C# with full Apple MIDI session protocol support. Enables bidirectional MIDI over IP — receive notes, CC, program changes and send LED feedback to hardware controllers via network MIDI bridges (macOS, rtpMIDI, raveloxmidi, iConnectivity).</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>© Copyright 2026 Hakan Lindestaf</Copyright>
+    <PackageProjectUrl>https://github.com/HakanL/Haukcode.RtpMidi</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/HakanL/Haukcode.RtpMidi</RepositoryUrl>
+    <PackageTags>midi rtp-midi network-midi apple-midi rfc6295 csharp dotnet</PackageTags>
+    <PackageReadmeFile>README_NUGET.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README_NUGET.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="RtpMidi.Mdns\**" />
+    <None Remove="RtpMidi.Mdns\**" />
+    <EmbeddedResource Remove="RtpMidi.Mdns\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Reactive" Version="6.0.1" />
+  </ItemGroup>
+</Project>

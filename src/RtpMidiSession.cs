@@ -53,6 +53,12 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // --- Sequence counter for outbound RTP packets ---
     private ushort sequenceNumber;
 
+    // --- SysEx reassembly state (receive side) ---
+    private List<byte>? sysExBuffer;
+
+    // --- SysEx fragmentation threshold (send side) ---
+    private const int MaxSysExBytesPerPacket = 128;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -206,10 +212,67 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
-        var ts  = RtpMidiPacket.CurrentTimestamp(sessionStart);
-        var pkt = RtpMidiPacket.Encode(localSsrc, sequenceNumber++, ts, midiBytes.Span);
+        foreach (var segment in BuildSysExFragments(midiBytes))
+        {
+            var ts  = RtpMidiPacket.CurrentTimestamp(sessionStart);
+            var pkt = RtpMidiPacket.Encode(localSsrc, sequenceNumber++, ts, segment.Span);
+            await dataSocket!.SendAsync(pkt, ct);
+        }
+    }
 
-        await dataSocket!.SendAsync(pkt, ct);
+    /// <summary>
+    /// Splits a large SysEx message into segments per RFC 6295 §3.3.
+    /// Non-SysEx messages or SysEx that fits within <see cref="MaxSysExBytesPerPacket"/>
+    /// are returned as-is in a single-element enumeration.
+    ///
+    /// Segment markers:
+    ///   First segment:  F0 … F0  (trailing F0 = "continuation follows")
+    ///   Middle segment: F7 … F0
+    ///   Last segment:   F7 … F7
+    ///   Unfragmented:   F0 … F7  (passed through unchanged)
+    /// </summary>
+    internal static IEnumerable<ReadOnlyMemory<byte>> BuildSysExFragments(ReadOnlyMemory<byte> midiBytes)
+    {
+        var span = midiBytes.Span;
+
+        // Only fragment when: it's a SysEx AND it exceeds the per-packet limit.
+        if (span.Length <= MaxSysExBytesPerPacket
+            || span[0] != 0xF0
+            || span[span.Length - 1] != 0xF7)
+        {
+            yield return midiBytes;
+            yield break;
+        }
+
+        // Inner payload: strip the outer F0 and F7.
+        int innerStart  = 1;
+        int innerLength = midiBytes.Length - 2;
+
+        // Each fragment: [opening] [inner chunk] [closing] ≤ MaxSysExBytesPerPacket bytes.
+        int maxInnerPerFragment = MaxSysExBytesPerPacket - 2;
+
+        int offset  = 0;
+        bool isFirst = true;
+
+        while (offset < innerLength)
+        {
+            int remaining = innerLength - offset;
+            bool isLast   = remaining <= maxInnerPerFragment;
+            int chunkSize = isLast ? remaining : maxInnerPerFragment;
+
+            byte opening = isFirst ? (byte)0xF0 : (byte)0xF7;
+            byte closing = isLast  ? (byte)0xF7 : (byte)0xF0;
+
+            var seg = new byte[1 + chunkSize + 1];
+            seg[0] = opening;
+            midiBytes.Slice(innerStart + offset, chunkSize).Span.CopyTo(seg.AsSpan(1));
+            seg[seg.Length - 1] = closing;
+
+            yield return seg;
+
+            offset  += chunkSize;
+            isFirst  = false;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -352,7 +415,11 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 else if (isData && RtpMidiPacket.TryParse(buf, out var midiPkt) && midiPkt != null)
                 {
                     if (!midiPkt.MidiBytes.IsEmpty)
-                        midiSubject.OnNext(midiPkt.MidiBytes);
+                    {
+                        var assembled = AssembleSysExFragment(midiPkt.MidiBytes);
+                        if (assembled.HasValue)
+                            midiSubject.OnNext(assembled.Value);
+                    }
                 }
             }
         }
@@ -364,6 +431,61 @@ public sealed class RtpMidiSession : IRtpMidiSession
             if (State == SessionState.Connected)
                 _ = DisconnectAsync();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // SysEx reassembly
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Reassembles a potentially fragmented SysEx from a single RTP-MIDI packet's MIDI bytes.
+    ///
+    /// Per RFC 6295 §3.3, segments are identified by their opening and closing bytes:
+    ///   F0 … F0  → first fragment  (buffer, wait for more)
+    ///   F7 … F0  → middle fragment (buffer, wait for more)
+    ///   F7 … F7  → last fragment   (emit assembled SysEx)
+    ///   F0 … F7  → complete SysEx  (emit immediately)
+    ///   Anything else → emit immediately (non-SysEx or malformed; reset buffer)
+    /// </summary>
+    internal ReadOnlyMemory<byte>? AssembleSysExFragment(ReadOnlyMemory<byte> midiBytes)
+    {
+        var span  = midiBytes.Span;
+        byte first = span[0];
+        byte last  = span[span.Length - 1];
+
+        // First fragment of a fragmented SysEx: F0 … F0
+        if (first == 0xF0 && last == 0xF0)
+        {
+            // Buffer everything except the trailing continuation F0.
+            // Use a generous initial capacity since we expect more fragments to follow.
+            sysExBuffer = new List<byte>(512);
+            sysExBuffer.AddRange(span[..^1].ToArray()); // F0 [data...]
+            return null;
+        }
+
+        // Middle or last fragment: opens with F7 and we have an active buffer.
+        if (first == 0xF7 && sysExBuffer != null)
+        {
+            if (last == 0xF7)
+            {
+                // Last fragment — append [data... F7] (skip the opening F7), then emit.
+                sysExBuffer.AddRange(span[1..].ToArray());
+                var result = sysExBuffer.ToArray();
+                sysExBuffer = null;
+                return result;
+            }
+            else
+            {
+                // Middle fragment (ends with F0) — append inner bytes only, skipping both markers.
+                sysExBuffer.AddRange(span[1..^1].ToArray());
+                return null;
+            }
+        }
+
+        // Complete SysEx (F0 … F7), non-SysEx, or orphan F7 without a prior buffer
+        // — emit as-is and reset any stale buffer.
+        sysExBuffer = null;
+        return midiBytes;
     }
 
     // -------------------------------------------------------------------------

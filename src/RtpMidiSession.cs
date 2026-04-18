@@ -28,6 +28,19 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private readonly string localName;
     private readonly uint   localSsrc;
 
+    /// <summary>
+    /// Optional diagnostic hook. When set, every outbound / inbound packet
+    /// and every session-protocol event (IN/OK/NO/BY/CK) is routed here so
+    /// callers can correlate wire traffic with peer disconnections. No-op
+    /// when null (default). Assign from application startup, e.g.
+    /// <c>RtpMidiSession.TraceHook = msg =&gt; logger.LogTrace(msg);</c>.
+    ///
+    /// Call sites MUST guard with <c>if (TraceHook != null)</c> before
+    /// building the message string — the interpolation cost is otherwise
+    /// paid on every packet even when no hook is attached.
+    /// </summary>
+    public static Action<string>? TraceHook;
+
     // --- Session state ---
     private readonly Subject<ReadOnlyMemory<byte>> midiSubject  = new();
     private readonly Subject<SessionState>          stateSubject = new();
@@ -124,6 +137,9 @@ public sealed class RtpMidiSession : IRtpMidiSession
         controlSocket.Connect(remoteControlEp);
         dataSocket.Connect(remoteDataEp);
 
+        if (TraceHook != null)
+            TraceHook($"[{localName}] ConnectAsync target={controlEndPoint} localSsrc={localSsrc:X8} initiatorToken={initiatorToken:X8} seqStart={sequenceNumber}");
+
         State = SessionState.ConnectingControl;
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -167,6 +183,9 @@ public sealed class RtpMidiSession : IRtpMidiSession
         sessionStart = DateTime.UtcNow;
         clockSync    = new ClockSync(sessionStart);
         sequenceNumber = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+
+        if (TraceHook != null)
+            TraceHook($"[{localName}] ListenAsync controlPort={controlPort} dataPort={dataPort} localSsrc={localSsrc:X8} seqStart={sequenceNumber}");
 
         State = SessionState.ConnectingControl;
 
@@ -212,10 +231,17 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
+        int fragmentIndex = 0;
         foreach (var segment in BuildSysExFragments(midiBytes))
         {
             var ts  = RtpMidiPacket.CurrentTimestamp(sessionStart);
-            var pkt = RtpMidiPacket.Encode(localSsrc, sequenceNumber++, ts, segment.Span);
+            var pkt = RtpMidiPacket.Encode(localSsrc, sequenceNumber, ts, segment.Span);
+
+            if (TraceHook != null)
+                TraceHook($"[{localName}] TX seq={sequenceNumber} ts={ts} frag={fragmentIndex} midi={segment.Length}B pkt={pkt.Length}B firstMidi={Preview(segment.Span, 12)} pkt={Preview(pkt, 24)}");
+            sequenceNumber++;
+            fragmentIndex++;
+
             await dataSocket!.SendAsync(pkt, ct);
         }
     }
@@ -275,6 +301,19 @@ public sealed class RtpMidiSession : IRtpMidiSession
         }
     }
 
+    private static string Preview(ReadOnlySpan<byte> bytes, int maxBytes)
+    {
+        int count = Math.Min(bytes.Length, maxBytes);
+        var sb = new System.Text.StringBuilder(count * 3);
+        for (int i = 0; i < count; i++)
+        {
+            if (i > 0) sb.Append(' ');
+            sb.Append(bytes[i].ToString("X2"));
+        }
+        if (bytes.Length > maxBytes) sb.Append(" …");
+        return sb.ToString();
+    }
+
     // -------------------------------------------------------------------------
     // Disconnect
     // -------------------------------------------------------------------------
@@ -320,6 +359,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
         // Retry up to 3 times with 1 s gap (matches Apple reference behavior)
         for (int attempt = 0; attempt < 3; attempt++)
         {
+            if (TraceHook != null)
+                TraceHook($"[{localName}] TX session Invitation to {remote} (attempt {attempt + 1}/3) token={initiatorToken:X8} ssrc={localSsrc:X8}");
             await socket.SendAsync(encoded, ct);
 
             using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -377,6 +418,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 localName);
 
             var encoded = AppleSessionProtocol.Encode(ok);
+            if (TraceHook != null)
+                TraceHook($"[{localName}] TX session InvitationAccepted to {result.RemoteEndPoint} remote='{packet.Name}' remoteSsrc={remoteSsrc:X8} localSsrc={localSsrc:X8}");
             await socket.SendAsync(encoded, result.RemoteEndPoint, ct);
 
             return result.RemoteEndPoint;
@@ -408,18 +451,34 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 if (AppleSessionProtocol.TryParse(buf, out var sessionPkt, out var clockPkt))
                 {
                     if (clockPkt != null)
+                    {
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] RX clock ({(isData ? "data" : "control")}) from {result.RemoteEndPoint}");
                         await HandleClockPacketAsync(socket, clockPkt, ct);
+                    }
                     else if (sessionPkt != null)
+                    {
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] RX session {sessionPkt.Command} ({(isData ? "data" : "control")}) from {result.RemoteEndPoint} remote='{sessionPkt.Name}' ssrc={sessionPkt.Ssrc:X8}");
                         HandleSessionControlPacket(sessionPkt);
+                    }
                 }
                 else if (isData && RtpMidiPacket.TryParse(buf, out var midiPkt) && midiPkt != null)
                 {
                     if (!midiPkt.MidiBytes.IsEmpty)
                     {
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] RX seq={midiPkt.SequenceNumber} ts={midiPkt.Timestamp} midi={midiPkt.MidiBytes.Length}B firstMidi={Preview(midiPkt.MidiBytes.Span, 12)}");
+
                         var assembled = AssembleSysExFragment(midiPkt.MidiBytes);
                         if (assembled.HasValue)
                             midiSubject.OnNext(assembled.Value);
                     }
+                }
+                else
+                {
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] RX unrecognised {buf.Length}B from {result.RemoteEndPoint} first={Preview(buf, 16)}");
                 }
             }
         }
@@ -558,7 +617,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // Shutdown helpers
     // -------------------------------------------------------------------------
 
-    private static async Task SendByAsync(UdpClient? socket, IPEndPoint? remote)
+    private async Task SendByAsync(UdpClient? socket, IPEndPoint? remote)
     {
         if (socket == null || remote == null) return;
         try
@@ -569,6 +628,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 0,
                 0,
                 null);
+            if (TraceHook != null)
+                TraceHook($"[{localName}] TX session EndSession (BY) to {remote}");
             await socket.SendAsync(AppleSessionProtocol.Encode(by));
         }
         catch { /* best-effort */ }

@@ -514,6 +514,15 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     {
                         if (TraceHook != null)
                             TraceHook($"[{localName}] RX session RS from {result.RemoteEndPoint} ssrc={feedbackPkt.Ssrc:X8} lastSeq={feedbackPkt.LastReceivedSequence}");
+
+                        // Advance recovery journal checkpoint: if the remote has confirmed
+                        // receiving our SysEx packet (or any packet after it), clear the
+                        // journal so we stop carrying stale data.
+                        if (lastSysExPayload != null
+                            && (short)(feedbackPkt.LastReceivedSequence - lastSysExSeqNum) >= 0)
+                        {
+                            lastSysExPayload = null;
+                        }
                     }
                     else if (sessionPkt != null)
                     {
@@ -570,6 +579,17 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     }
 
                     expectedSeqNum = (ushort)(midiPkt.SequenceNumber + 1);
+
+                    // Send RS (Receiver Feedback) on the control socket so the remote
+                    // peer can advance its recovery journal checkpoint.
+                    if (controlSocket != null)
+                    {
+                        var rs = new ReceiverFeedbackPacket(localSsrc, midiPkt.SequenceNumber);
+                        var encoded = AppleSessionProtocol.EncodeReceiverFeedback(rs);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX RS lastSeq={midiPkt.SequenceNumber}");
+                        await controlSocket.SendAsync(encoded, ct);
+                    }
 
                     if (!midiPkt.MidiBytes.IsEmpty)
                     {

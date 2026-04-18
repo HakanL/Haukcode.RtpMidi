@@ -163,3 +163,97 @@ Channel-message journal chapters (N, V, C, E, T, …) are not yet implemented bu
 Bug reports and pull requests welcome at https://github.com/HakanL/Haukcode.RtpMidi.
 
 When contributing protocol-level changes, please reference the relevant section of [RFC 6295](https://datatracker.ietf.org/doc/html/rfc6295) or the Apple MIDI session protocol documentation.
+
+---
+
+## Interoperability testing
+
+A dedicated CLI tool lives in `tests/RtpMidi.InteropTest`.
+It can run in two modes and is useful for validating changes against real implementations.
+
+### Mode 1 — Client (connect to a known peer and run checks)
+
+```
+dotnet run --project tests/RtpMidi.InteropTest -- client --host <ip> --port 5004 [--name InteropTest] [--loopback]
+```
+
+Runs the following checks in order and prints PASS / FAIL / SKIP for each.
+Exit code 0 means all non-skipped checks passed.
+
+| # | Check | Notes |
+|---|-------|-------|
+| 1 | Session handshake (IN → OK, control + data) | Always runs |
+| 2 | Clock sync (CK0 → CK1 → CK2) | Always runs |
+| 3 | MIDI round-trip (Note On / Note Off) | Requires `--loopback` |
+| 4 | SysEx fragmentation / reassembly (>128 bytes) | Requires `--loopback` |
+| 5 | Recovery journal enabled (Chapter X) | Always runs |
+| 6 | Clean disconnection (BY) | Always runs |
+
+Pass `--loopback` when the peer is configured to echo all received MIDI back (e.g. server mode below, or a DAW in MIDI-thru mode).
+
+A Wireshark display filter for the chosen port is printed at startup:
+
+```
+Wireshark filter: udp.port == 5004 || udp.port == 5005
+```
+
+### Mode 2 — Server (act as a reference peer for other implementations)
+
+```
+dotnet run --project tests/RtpMidi.InteropTest -- server [--port 5004] [--name InteropTest]
+```
+
+- Accepts incoming connections (IN → OK)
+- Completes clock sync
+- **Echoes all received MIDI back** to the sender (loopback mode)
+- Reports each received packet to stdout
+- Advertises via mDNS (`_apple-midi._udp`) so the session appears automatically in macOS Audio MIDI Setup and rtpMIDI
+
+### Setting up known-good peers
+
+| Peer | Platform | Setup |
+|------|----------|-------|
+| macOS CoreMIDI | macOS | Open **Audio MIDI Setup** → **Window → Show MIDI Studio** → double-click **Network** → add a session and enable the "My Sessions" checkbox |
+| [rtpMIDI](https://www.tobias-erichsen.de/software/rtpmidi.html) | Windows | Install, create a session on port 5004, connect to the host running the interop tool |
+| [rtpmidid](https://github.com/davidmoreno/rtpmidid) | Linux | `rtpmidid --port 5004` — note: no recovery journal support |
+
+### Example: full interop run against the built-in server
+
+In one terminal start the server:
+
+```
+dotnet run --project tests/RtpMidi.InteropTest -- server --port 5004
+```
+
+In a second terminal run the client with loopback enabled:
+
+```
+dotnet run --project tests/RtpMidi.InteropTest -- client --host 127.0.0.1 --port 5004 --loopback
+```
+
+Expected output (all checks pass):
+
+```
+Wireshark filter: udp.port == 5004 || udp.port == 5005
+
+Client mode → 127.0.0.1:5004  (name=InteropTest)
+
+  [1/6] Session handshake (IN → OK)…       PASS  (connected to 'InteropTest')
+  [2/6] Clock sync (CK0 → CK1 → CK2)…     PASS  (session still connected after 500 ms)
+  [3/6] MIDI round-trip (Note On/Off)…     PASS  (Note On + Note Off echoed back)
+  [4/6] SysEx fragmentation/reassembly…   PASS  (200-byte SysEx echoed back intact)
+  [5/6] Recovery journal (Chapter X)…     PASS  (EnableRecoveryJournal=true …)
+  [6/6] Clean disconnection (BY)…         PASS  (DisconnectAsync completed without error)
+
+─────────────────────────────────────────────────────────
+  PASS  handshake               connected to 'InteropTest'
+  PASS  clock-sync              session still connected after 500 ms
+  PASS  midi-roundtrip          Note On + Note Off echoed back
+  PASS  sysex-frag              200-byte SysEx echoed back intact
+  PASS  recovery-journal        EnableRecoveryJournal=true …
+  PASS  disconnect              DisconnectAsync completed without error
+─────────────────────────────────────────────────────────
+  6 passed  /  0 failed  /  0 skipped
+
+All checks passed. ✓
+```

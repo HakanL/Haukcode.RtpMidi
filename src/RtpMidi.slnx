@@ -6,6 +6,7 @@
   </Configurations>
   <Folder Name="/tests/">
     <Project Path="../tests/RtpMidi.Tests/RtpMidi.Tests.csproj" />
+    <Project Path="../tests/RtpMidi.InteropTest/RtpMidi.InteropTest.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="../samples/RtpMidi.Sample/RtpMidi.Sample.csproj" />

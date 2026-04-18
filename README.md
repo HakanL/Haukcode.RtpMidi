@@ -126,9 +126,24 @@ RTP-MIDI uses two UDP ports per session:
 
 The clock sync exchange (CK0 → CK1 → CK2) is **mandatory** — hardware bridges will not confirm the connection until it completes. This library implements the full 3-way exchange and repeats it every ~10 seconds to maintain the session.
 
-### Journal (RFC 6295 §4)
+### Journal (RFC 6295 §4 / §A.3)
 
-Journal-based packet loss recovery is not implemented in v1.0. This is safe for LAN use where UDP loss is negligible. Journal support is planned for a future release.
+The library implements **Chapter X (System Exclusive) journal recovery** per RFC 6295 §A.3.
+
+When a SysEx message is sent, the session automatically buffers it and appends a recovery journal to every subsequent outgoing packet. The journal carries the last complete SysEx payload so that a receiver who missed the original packet can reconstruct it from the next packet it receives, without audible glitches or session tears.
+
+On the receive side the session tracks sequence numbers. When a gap is detected, the incoming packet's journal is consulted and any recovered SysEx is emitted to `MidiReceived` subscribers before the current packet's MIDI data.
+
+This is the key feature that prevents Apple CoreMIDI (macOS) from dropping sessions that transport SysEx.
+
+**Configuration**:
+
+```csharp
+// Enabled by default; disable only on strictly loss-free paths
+session.EnableRecoveryJournal = false;
+```
+
+Channel-message journal chapters (N, V, C, E, T, …) are not yet implemented but can be added incrementally — Chapter X is the one that unblocks Apple interop.
 
 ---
 

@@ -7,6 +7,7 @@ namespace Haukcode.RtpMidi;
 ///   [RTP header: 12 bytes]
 ///   [MIDI command section header: 1-2 bytes]
 ///   [MIDI commands: variable]
+///   [Recovery journal: variable, present only when J=1]
 ///
 /// RTP header layout (network byte order):
 ///   Byte 0:  V=2 P=0 X=0 CC=0  → 0x80
@@ -18,6 +19,8 @@ namespace Haukcode.RtpMidi;
 /// MIDI command section header:
 ///   If B=0 (short): 1 byte — [B=0][J=0][Z=0][P=0][len: 4 bits]
 ///   If B=1 (long):  2 bytes — [B=1][J=0][Z=0][P=0][len hi: 4 bits][len lo: 8 bits]
+///
+/// When J=1 a recovery journal (RFC 6295 §5) immediately follows the MIDI commands.
 /// </summary>
 public sealed class RtpMidiPacket
 {
@@ -37,6 +40,12 @@ public sealed class RtpMidiPacket
 
     /// <summary>Raw MIDI bytes extracted from the MIDI command section.</summary>
     public ReadOnlyMemory<byte> MidiBytes { get; init; }
+
+    /// <summary>
+    /// Raw recovery journal bytes following the MIDI command section.
+    /// Empty when J=0 (no journal present in this packet).
+    /// </summary>
+    public ReadOnlyMemory<byte> JournalBytes { get; init; }
 
     // -------------------------------------------------------------------------
     // Parse
@@ -66,7 +75,8 @@ public sealed class RtpMidiPacket
         if (section.IsEmpty)
             return false;
 
-        bool longHeader = (section[0] & 0x80) != 0;
+        bool longHeader     = (section[0] & 0x80) != 0;
+        bool journalPresent = (section[0] & 0x40) != 0;
         int midiLen;
         int headerBytes;
 
@@ -88,12 +98,18 @@ public sealed class RtpMidiPacket
 
         var midiBytes = section.Slice(headerBytes, midiLen).ToArray();
 
+        // Extract journal bytes when J=1 (RFC 6295 §5)
+        var journalBytes = journalPresent
+            ? section.Slice(headerBytes + midiLen).ToArray()
+            : Array.Empty<byte>();
+
         packet = new RtpMidiPacket
         {
             SequenceNumber = seq,
             Timestamp = ts,
             Ssrc = ssrc,
             MidiBytes = midiBytes,
+            JournalBytes = journalBytes,
         };
 
         return true;
@@ -103,11 +119,23 @@ public sealed class RtpMidiPacket
     // Encode
     // -------------------------------------------------------------------------
 
+    /// <summary>Encodes an RTP-MIDI packet without a recovery journal (J=0).</summary>
     public static byte[] Encode(uint ssrc, ushort sequenceNumber, uint timestamp, ReadOnlySpan<byte> midiBytes)
+        => Encode(ssrc, sequenceNumber, timestamp, midiBytes, ReadOnlySpan<byte>.Empty);
+
+    /// <summary>
+    /// Encodes an RTP-MIDI packet with an optional recovery journal (J=1 when journal is non-empty).
+    /// </summary>
+    /// <param name="journalBytes">
+    /// Pre-encoded journal bytes (see <see cref="RtpMidiJournal"/>).
+    /// Pass <see cref="ReadOnlySpan{T}.Empty"/> to omit the journal (J=0).
+    /// </param>
+    public static byte[] Encode(uint ssrc, ushort sequenceNumber, uint timestamp, ReadOnlySpan<byte> midiBytes, ReadOnlySpan<byte> journalBytes)
     {
-        bool longHeader = midiBytes.Length > 15;
-        int headerBytes = longHeader ? 2 : 1;
-        var buf = new byte[RtpHeaderSize + headerBytes + midiBytes.Length];
+        bool longHeader     = midiBytes.Length > 15;
+        bool journalPresent = !journalBytes.IsEmpty;
+        int  headerBytes    = longHeader ? 2 : 1;
+        var  buf            = new byte[RtpHeaderSize + headerBytes + midiBytes.Length + journalBytes.Length];
 
         // RTP header
         buf[0] = RtpVersion;
@@ -117,8 +145,8 @@ public sealed class RtpMidiPacket
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(8), ssrc);
 
         // MIDI command section header (RFC 6295 §3.2)
-        // J/Z/P stay 0 until their respective features are implemented — see HakanL/Haukcode.RtpMidi#2 for journal.
         byte flags = 0;
+        if (journalPresent) flags |= FlagJournal;
 
         if (longHeader)
         {
@@ -132,6 +160,9 @@ public sealed class RtpMidiPacket
         }
 
         midiBytes.CopyTo(buf.AsSpan(RtpHeaderSize + headerBytes));
+
+        if (journalPresent)
+            journalBytes.CopyTo(buf.AsSpan(RtpHeaderSize + headerBytes + midiBytes.Length));
 
         return buf;
     }

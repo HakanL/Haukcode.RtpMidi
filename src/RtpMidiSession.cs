@@ -72,6 +72,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // --- SysEx fragmentation threshold (send side) ---
     private const int MaxSysExBytesPerPacket = 128;
 
+    // --- Recovery journal state ---
+    private byte[]? lastSysExPayload;
+    private ushort  lastSysExSeqNum;
+
+    // --- Inbound sequence tracking for gap detection ---
+    private ushort? expectedSeqNum;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -106,6 +113,18 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
     public string? RemoteName { get; private set; }
 
+    /// <summary>
+    /// When <c>true</c> (the default), the session appends an RFC 6295 Chapter X recovery
+    /// journal to every outgoing RTP-MIDI packet that follows a SysEx transmission.
+    /// The journal lets the remote peer reconstruct a dropped SysEx packet from the next
+    /// received packet, preventing hard session drops from strict implementations
+    /// (e.g. Apple CoreMIDI).
+    ///
+    /// Set to <c>false</c> only on strictly loss-free environments where the extra bytes
+    /// are unwanted.
+    /// </summary>
+    public bool EnableRecoveryJournal { get; set; } = true;
+
     // -------------------------------------------------------------------------
     // Connect (initiator role)
     // -------------------------------------------------------------------------
@@ -128,6 +147,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
         clockSync        = new ClockSync(sessionStart);
         initiatorToken   = AppleSessionProtocol.GenerateInitiatorToken();
         sequenceNumber   = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+        lastSysExPayload = null;
+        expectedSeqNum   = null;
 
         // Bind local sockets on ephemeral ports (OS assigns)
         controlSocket = new UdpClient(0);
@@ -182,7 +203,9 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
         sessionStart = DateTime.UtcNow;
         clockSync    = new ClockSync(sessionStart);
-        sequenceNumber = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+        sequenceNumber   = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+        lastSysExPayload = null;
+        expectedSeqNum   = null;
 
         if (TraceHook != null)
             TraceHook($"[{localName}] ListenAsync controlPort={controlPort} dataPort={dataPort} localSsrc={localSsrc:X8} seqStart={sequenceNumber}");
@@ -231,11 +254,29 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
+        // Track the last complete SysEx for the recovery journal BEFORE fragmenting.
+        // midiBytes here is the full (pre-fragmentation) payload.
+        if (EnableRecoveryJournal
+            && midiBytes.Length >= 2
+            && midiBytes.Span[0] == 0xF0
+            && midiBytes.Span[midiBytes.Length - 1] == 0xF7)
+        {
+            lastSysExPayload = midiBytes.ToArray();
+            lastSysExSeqNum  = sequenceNumber; // checkpoint = first fragment's seq num
+        }
+
         int fragmentIndex = 0;
         foreach (var segment in BuildSysExFragments(midiBytes))
         {
+            // Build the recovery journal if we have a SysEx to protect
+            byte[]? journal = null;
+            if (EnableRecoveryJournal && lastSysExPayload != null)
+                journal = RtpMidiJournal.EncodeChapterX(lastSysExSeqNum, lastSysExPayload);
+
             var ts  = RtpMidiPacket.CurrentTimestamp(sessionStart);
-            var pkt = RtpMidiPacket.Encode(localSsrc, sequenceNumber, ts, segment.Span);
+            var pkt = journal != null
+                ? RtpMidiPacket.Encode(localSsrc, sequenceNumber, ts, segment.Span, journal)
+                : RtpMidiPacket.Encode(localSsrc, sequenceNumber, ts, segment.Span);
 
             if (TraceHook != null)
                 TraceHook($"[{localName}] TX seq={sequenceNumber} ts={ts} frag={fragmentIndex} midi={segment.Length}B pkt={pkt.Length}B firstMidi={Preview(segment.Span, 12)} pkt={Preview(pkt, 24)}");
@@ -465,6 +506,24 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 }
                 else if (isData && RtpMidiPacket.TryParse(buf, out var midiPkt) && midiPkt != null)
                 {
+                    // Check for sequence-number gap and attempt journal recovery
+                    if (expectedSeqNum.HasValue && midiPkt.SequenceNumber != expectedSeqNum.Value)
+                    {
+                        // One or more packets were lost — consult the recovery journal
+                        if (!midiPkt.JournalBytes.IsEmpty
+                            && RtpMidiJournal.TryParseChapterX(
+                                midiPkt.JournalBytes.Span,
+                                out var checkpointSeq,
+                                out var recoveredSysEx)
+                            && recoveredSysEx != null
+                            && IsInGap(checkpointSeq, expectedSeqNum.Value, midiPkt.SequenceNumber))
+                        {
+                            midiSubject.OnNext(recoveredSysEx);
+                        }
+                    }
+
+                    expectedSeqNum = (ushort)(midiPkt.SequenceNumber + 1);
+
                     if (!midiPkt.MidiBytes.IsEmpty)
                     {
                         if (TraceHook != null)
@@ -550,6 +609,14 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // -------------------------------------------------------------------------
     // Clock sync
     // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Returns true if <paramref name="checkpointSeq"/> falls within the gap
+    /// [<paramref name="gapStart"/>, <paramref name="receivedSeq"/> - 1] using
+    /// unsigned 16-bit wraparound arithmetic.
+    /// </summary>
+    private static bool IsInGap(ushort checkpointSeq, ushort gapStart, ushort receivedSeq)
+        => (ushort)(checkpointSeq - gapStart) < (ushort)(receivedSeq - gapStart);
 
     private async Task ClockSyncLoopAsync(CancellationToken ct)
     {

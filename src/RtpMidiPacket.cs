@@ -25,6 +25,12 @@ public sealed class RtpMidiPacket
     private const byte PayloadType   = 97;
     private const int  RtpHeaderSize = 12;
 
+    // RFC 6295 §3.2 — MIDI command section header flag bits
+    private const byte FlagBig     = 0x80; // B: big-header (1 = 12-bit length, 2-byte header)
+    private const byte FlagJournal = 0x40; // J: journal present (recovery journal follows MIDI list)
+    private const byte FlagDelta   = 0x20; // Z: first MIDI command has a delta-time
+    private const byte FlagPhantom = 0x10; // P: phantom status (re-uses running status from previous packet)
+
     public ushort SequenceNumber { get; init; }
     public uint Timestamp { get; init; }
     public uint Ssrc { get; init; }
@@ -110,15 +116,19 @@ public sealed class RtpMidiPacket
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(4), timestamp);
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(8), ssrc);
 
-        // MIDI command section header
+        // MIDI command section header (RFC 6295 §3.2)
+        // J/Z/P stay 0 until their respective features are implemented — see HakanL/Haukcode.RtpMidi#2 for journal.
+        byte flags = 0;
+
         if (longHeader)
         {
-            buf[12] = (byte)(0x80 | ((midiBytes.Length >> 8) & 0x0F));
+            flags |= FlagBig;
+            buf[12] = (byte)(flags | ((midiBytes.Length >> 8) & 0x0F));
             buf[13] = (byte)(midiBytes.Length & 0xFF);
         }
         else
         {
-            buf[12] = (byte)(midiBytes.Length & 0x0F);
+            buf[12] = (byte)(flags | (midiBytes.Length & 0x0F));
         }
 
         midiBytes.CopyTo(buf.AsSpan(RtpHeaderSize + headerBytes));

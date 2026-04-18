@@ -162,4 +162,44 @@ public class AppleSessionProtocolTests
         var buf = new byte[] { 0xFF, 0xFF, 0x52, 0x53, 0x48, 0xD3, 0x6A, 0xB5 };
         Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _, out _));
     }
+
+    [Fact]
+    public void ReceiverFeedback_RoundTrip()
+    {
+        var original = new ReceiverFeedbackPacket(Ssrc: 0x48D36AB5, LastReceivedSequence: 0x8F63);
+
+        var encoded = AppleSessionProtocol.EncodeReceiverFeedback(original);
+        Assert.True(AppleSessionProtocol.TryParse(encoded, out var session, out var clock, out var feedback));
+        Assert.Null(session);
+        Assert.Null(clock);
+        Assert.NotNull(feedback);
+        Assert.Equal(0x48D36AB5u, feedback.Ssrc);
+        Assert.Equal(0x8F63, feedback.LastReceivedSequence);
+    }
+
+    [Fact]
+    public void ReceiverFeedback_Encode_WireFormat()
+    {
+        var packet  = new ReceiverFeedbackPacket(Ssrc: 0x48D36AB5, LastReceivedSequence: 0x8F63);
+        var encoded = AppleSessionProtocol.EncodeReceiverFeedback(packet);
+
+        Assert.Equal(12, encoded.Length);
+        // Signature
+        Assert.Equal(0xFF, encoded[0]);
+        Assert.Equal(0xFF, encoded[1]);
+        // 'R','S' command
+        Assert.Equal(0x52, encoded[2]);
+        Assert.Equal(0x53, encoded[3]);
+        // SSRC big-endian
+        Assert.Equal(0x48, encoded[4]);
+        Assert.Equal(0xD3, encoded[5]);
+        Assert.Equal(0x6A, encoded[6]);
+        Assert.Equal(0xB5, encoded[7]);
+        // Last received sequence big-endian
+        Assert.Equal(0x8F, encoded[8]);
+        Assert.Equal(0x63, encoded[9]);
+        // Padding
+        Assert.Equal(0x00, encoded[10]);
+        Assert.Equal(0x00, encoded[11]);
+    }
 }

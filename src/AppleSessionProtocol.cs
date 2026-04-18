@@ -175,6 +175,20 @@ public static class AppleSessionProtocol
         return buf;
     }
 
+    public static byte[] EncodeReceiverFeedback(ReceiverFeedbackPacket packet)
+    {
+        var buf = new byte[ReceiverFeedbackPacketSize];
+
+        buf[0] = SignatureByte;
+        buf[1] = SignatureByte;
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(2), (ushort)AppleSessionCommand.ReceiverFeedback);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(4), packet.Ssrc);
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(8), packet.LastReceivedSequence);
+        // bytes 10-11: padding, already zero
+
+        return buf;
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

@@ -44,6 +44,30 @@ public class RtpMidiPacketTests
     }
 
     [Fact]
+    public void ShortHeader_ExactByteValue_10ByteMessage()
+    {
+        // 10-byte MIDI payload → short header, buf[12] must be 0x0A (length only, no flags set)
+        var midi = new byte[10];
+        var encoded = RtpMidiPacket.Encode(1, 1, 0, midi);
+
+        Assert.Equal(0x0A, encoded[12]);
+    }
+
+    [Fact]
+    public void LongHeader_ExactByteValues_200ByteMessage()
+    {
+        // 200-byte MIDI payload → long header
+        // buf[12]: B=1 (0x80) | length-high nibble = (200 >> 8) & 0x0F = 0 → 0x80
+        // buf[13]: length-low byte = 200 & 0xFF = 0xC8
+        var midi = new byte[200];
+        var encoded = RtpMidiPacket.Encode(1, 1, 0, midi);
+
+        Assert.Equal(0x80, encoded[12]);
+        Assert.Equal(0xC8, encoded[13]);
+    }
+
+
+    [Fact]
     public void SysEx_RoundTrip()
     {
         // Typical SysEx: F0 ... F7

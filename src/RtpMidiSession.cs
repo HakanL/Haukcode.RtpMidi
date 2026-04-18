@@ -26,7 +26,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
     // --- Local identity ---
     private readonly string localName;
-    private readonly uint   localSsrc;
+    private uint   localSsrc;
 
     /// <summary>
     /// Optional diagnostic hook. When set, every outbound / inbound packet
@@ -172,6 +172,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
         // Step 2: Handshake data port
         await HandshakePortAsync(dataSocket, remoteDataEp, timeoutCts.Token);
+
+        // SSRC collision detection (RFC 3550 §8.2): if local and remote chose the same SSRC,
+        // regenerate the local one and restart the handshake.
+        if (DetectAndResolveSsrcCollision())
+            throw new InvalidOperationException(
+                $"SSRC collision with remote peer (SSRC={remoteSsrc:X8}). A new local SSRC has been assigned; please retry the connection.");
+
         State = SessionState.Connected;
 
         // Start receive loops and clock sync
@@ -236,6 +243,12 @@ public sealed class RtpMidiSession : IRtpMidiSession
         // Connect sockets so receive loops work symmetrically
         controlSocket.Connect(remoteControlEp);
         dataSocket.Connect(remoteDataEp);
+
+        // SSRC collision detection (RFC 3550 §8.2): if local and remote chose the same SSRC,
+        // regenerate the local one and restart the handshake.
+        if (DetectAndResolveSsrcCollision())
+            throw new InvalidOperationException(
+                $"SSRC collision with remote peer (SSRC={remoteSsrc:X8}). A new local SSRC has been assigned; please retry the connection.");
 
         State = SessionState.Connected;
 
@@ -506,11 +519,40 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     {
                         if (TraceHook != null)
                             TraceHook($"[{localName}] RX session {sessionPkt.Command} ({(isData ? "data" : "control")}) from {result.RemoteEndPoint} remote='{sessionPkt.Name}' ssrc={sessionPkt.Ssrc:X8}");
-                        HandleSessionControlPacket(sessionPkt);
+
+                        // Apple MIDI spec: when already connected, refuse new invitations on the
+                        // control port with NO so the initiator gives up immediately rather than
+                        // waiting for a timeout.
+                        if (!isData
+                            && sessionPkt.Command == AppleSessionCommand.Invitation
+                            && State == SessionState.Connected)
+                        {
+                            var no = new SessionPacket(
+                                AppleSessionCommand.InvitationRefused,
+                                AppleSessionProtocol.ProtocolVersion,
+                                sessionPkt.InitiatorToken,
+                                localSsrc,
+                                localName);
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] TX session InvitationRefused (NO) to {result.RemoteEndPoint} (already connected)");
+                            await socket.SendAsync(AppleSessionProtocol.Encode(no), ct);
+                        }
+                        else
+                        {
+                            HandleSessionControlPacket(sessionPkt);
+                        }
                     }
                 }
                 else if (isData && RtpMidiPacket.TryParse(buf, out var midiPkt) && midiPkt != null)
                 {
+                    // Discard RTP packets from unexpected SSRCs (RFC 3550 §8.2)
+                    if (midiPkt.Ssrc != remoteSsrc)
+                    {
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] RX discarding RTP from unexpected SSRC={midiPkt.Ssrc:X8} (expected {remoteSsrc:X8})");
+                        continue;
+                    }
+
                     // Check for sequence-number gap and attempt journal recovery
                     if (expectedSeqNum.HasValue && midiPkt.SequenceNumber != expectedSeqNum.Value)
                     {
@@ -683,6 +725,30 @@ public sealed class RtpMidiSession : IRtpMidiSession
             // Remote sent BY — tear down asynchronously
             _ = DisconnectAsync();
         }
+    }
+
+    /// <summary>
+    /// Checks whether <see cref="localSsrc"/> collides with <see cref="remoteSsrc"/>.
+    /// Per RFC 3550 §8.2, if a collision is detected a new SSRC is generated iteratively
+    /// until it no longer matches the remote's SSRC.
+    /// </summary>
+    /// <returns><c>true</c> if a collision was detected (and a new SSRC has been assigned).</returns>
+    private bool DetectAndResolveSsrcCollision()
+    {
+        if (localSsrc != remoteSsrc)
+            return false;
+
+        // Regenerate until unique (extremely unlikely to need more than one iteration).
+        do
+        {
+            localSsrc = AppleSessionProtocol.GenerateSsrc();
+        }
+        while (localSsrc == remoteSsrc);
+
+        if (TraceHook != null)
+            TraceHook($"[{localName}] SSRC collision detected (remoteSsrc={remoteSsrc:X8}); new localSsrc={localSsrc:X8}");
+
+        return true;
     }
 
     // -------------------------------------------------------------------------

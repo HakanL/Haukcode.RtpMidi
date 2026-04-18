@@ -76,6 +76,12 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private byte[]? lastSysExPayload;
     private ushort  lastSysExSeqNum;
 
+    // --- Per-channel MIDI state for recovery journal chapters P, C, W, N, Q, T, A ---
+    private readonly ChannelMidiState[] channelStates = new ChannelMidiState[16];
+
+    // --- System-level MIDI state for recovery journal chapter F ---
+    private readonly SystemMidiState systemMidiState = new();
+
     // --- Inbound sequence tracking for gap detection ---
     private ushort? expectedSeqNum;
 
@@ -88,6 +94,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
     {
         this.localName = localName;
         localSsrc = AppleSessionProtocol.GenerateSsrc();
+        for (int i = 0; i < 16; i++)
+            channelStates[i] = new ChannelMidiState();
     }
 
     // -------------------------------------------------------------------------
@@ -114,11 +122,14 @@ public sealed class RtpMidiSession : IRtpMidiSession
     public string? RemoteName { get; private set; }
 
     /// <summary>
-    /// When <c>true</c> (the default), the session appends an RFC 6295 Chapter X recovery
-    /// journal to every outgoing RTP-MIDI packet that follows a SysEx transmission.
-    /// The journal lets the remote peer reconstruct a dropped SysEx packet from the next
-    /// received packet, preventing hard session drops from strict implementations
-    /// (e.g. Apple CoreMIDI).
+    /// When <c>true</c> (the default), the session appends an RFC 6295 recovery journal
+    /// to every outgoing RTP-MIDI packet.  The journal encodes the most-recent MIDI state
+    /// across all chapters: Chapter X (SysEx), Chapter F (System Common), and channel
+    /// chapters V+P+C+W+N+Q+T+A (Program Change, Control Change, Pitch Wheel, Note Off,
+    /// Note On, Channel Pressure, Poly Key Pressure).
+    ///
+    /// This allows the remote peer to reconstruct dropped packets from the next received
+    /// packet, preventing hard session drops from strict implementations (e.g. Apple CoreMIDI).
     ///
     /// Set to <c>false</c> only on strictly loss-free environments where the extra bytes
     /// are unwanted.
@@ -267,24 +278,46 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
-        // Track the last complete SysEx for the recovery journal BEFORE fragmenting.
-        // midiBytes here is the full (pre-fragmentation) payload.
-        if (EnableRecoveryJournal
-            && midiBytes.Length >= 2
-            && midiBytes.Span[0] == 0xF0
-            && midiBytes.Span[midiBytes.Length - 1] == 0xF7)
+        // Update journal state BEFORE async operations — copy to array to avoid
+        // holding a ReadOnlySpan across await points (not permitted in async methods).
+        if (EnableRecoveryJournal && midiBytes.Length >= 1)
         {
-            lastSysExPayload = midiBytes.ToArray();
-            lastSysExSeqNum  = sequenceNumber; // checkpoint = first fragment's seq num
+            var data = midiBytes.ToArray();
+
+            // Track the last complete SysEx for the recovery journal BEFORE fragmenting.
+            if (data.Length >= 2 && data[0] == 0xF0 && data[data.Length - 1] == 0xF7)
+            {
+                lastSysExPayload = data;
+                lastSysExSeqNum  = sequenceNumber; // checkpoint = first fragment's seq num
+            }
+            else
+            {
+                byte status = data[0];
+                if (status < 0xF0)
+                {
+                    // Channel message — update per-channel state
+                    byte channel = (byte)(status & 0x0F);
+                    channelStates[channel].ProcessMidi(data);
+                }
+                else if (status == 0xF1 || status == 0xF2 || status == 0xF3)
+                {
+                    // System Common — update system state for Chapter F
+                    systemMidiState.ProcessMidi(data);
+                }
+            }
         }
 
         int fragmentIndex = 0;
         foreach (var segment in BuildSysExFragments(midiBytes))
         {
-            // Build the recovery journal if we have a SysEx to protect
+            // Build the recovery journal combining all accumulated state
             byte[]? journal = null;
-            if (EnableRecoveryJournal && lastSysExPayload != null)
-                journal = RtpMidiJournal.EncodeChapterX(lastSysExSeqNum, lastSysExPayload);
+            if (EnableRecoveryJournal)
+            {
+                var j = RtpMidiJournal.EncodeFullJournal(
+                    lastSysExSeqNum, lastSysExPayload, channelStates, systemMidiState);
+                if (j.Length > 0) journal = j;
+            }
 
             var ts  = RtpMidiPacket.CurrentTimestamp(sessionStart);
             var pkt = journal != null
@@ -567,14 +600,15 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     {
                         // One or more packets were lost — consult the recovery journal
                         if (!midiPkt.JournalBytes.IsEmpty
-                            && RtpMidiJournal.TryParseChapterX(
+                            && RtpMidiJournal.TryParseFullJournal(
                                 midiPkt.JournalBytes.Span,
                                 out var checkpointSeq,
-                                out var recoveredSysEx)
-                            && recoveredSysEx != null
+                                out var recoveredMessages)
+                            && recoveredMessages != null
                             && IsInGap(checkpointSeq, expectedSeqNum.Value, midiPkt.SequenceNumber))
                         {
-                            midiSubject.OnNext(recoveredSysEx);
+                            foreach (var msg in recoveredMessages)
+                                midiSubject.OnNext(msg);
                         }
                     }
 

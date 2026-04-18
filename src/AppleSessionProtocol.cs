@@ -36,6 +36,9 @@ public record ClockSyncPacket(
     ulong Timestamp2,
     ulong Timestamp3);
 
+/// <summary>Payload for RS (Receiver Feedback) packets.</summary>
+public record ReceiverFeedbackPacket(uint Ssrc, ushort LastReceivedSequence);
+
 /// <summary>
 /// Codec for the Apple MIDI session-control protocol (control port N).
 /// All values are big-endian on the wire (network byte order).
@@ -46,17 +49,19 @@ public static class AppleSessionProtocol
     public const uint ProtocolVersion = 2;
 
     // Minimum sizes
-    private const int MinSessionPacketSize = 16; // sig(2)+cmd(2)+ver(4)+token(4)+ssrc(4)
-    private const int ClockSyncPacketSize  = 36; // sig(2)+cmd(2)+ssrc(4)+count(1)+pad(3)+ts1(8)+ts2(8)+ts3(8)
+    private const int MinSessionPacketSize       = 16; // sig(2)+cmd(2)+ver(4)+token(4)+ssrc(4)
+    private const int ClockSyncPacketSize        = 36; // sig(2)+cmd(2)+ssrc(4)+count(1)+pad(3)+ts1(8)+ts2(8)+ts3(8)
+    private const int ReceiverFeedbackPacketSize = 12; // sig(2)+cmd(2)+ssrc(4)+seq(2)+pad(2)
 
     // -------------------------------------------------------------------------
     // Parse
     // -------------------------------------------------------------------------
 
-    public static bool TryParse(ReadOnlySpan<byte> data, out SessionPacket? packet, out ClockSyncPacket? clockPacket)
+    public static bool TryParse(ReadOnlySpan<byte> data, out SessionPacket? packet, out ClockSyncPacket? clockPacket, out ReceiverFeedbackPacket? feedbackPacket)
     {
         packet = null;
         clockPacket = null;
+        feedbackPacket = null;
 
         if (data.Length < 4 || data[0] != SignatureByte || data[1] != SignatureByte)
             return false;
@@ -65,6 +70,9 @@ public static class AppleSessionProtocol
 
         if (cmd == AppleSessionCommand.ClockSync)
             return TryParseClock(data, out clockPacket);
+
+        if (cmd == AppleSessionCommand.ReceiverFeedback)
+            return TryParseReceiverFeedback(data, out feedbackPacket);
 
         return TryParseSession(data, cmd, out packet);
     }
@@ -106,6 +114,20 @@ public static class AppleSessionProtocol
         var ts3 = BinaryPrimitives.ReadUInt64BigEndian(data[28..]);
 
         packet = new ClockSyncPacket(ssrc, count, ts1, ts2, ts3);
+        return true;
+    }
+
+    private static bool TryParseReceiverFeedback(ReadOnlySpan<byte> data, out ReceiverFeedbackPacket? packet)
+    {
+        packet = null;
+        if (data.Length < ReceiverFeedbackPacketSize)
+            return false;
+
+        var ssrc    = BinaryPrimitives.ReadUInt32BigEndian(data[4..]);
+        var lastSeq = BinaryPrimitives.ReadUInt16BigEndian(data[8..]);
+        // bytes 10-11 are padding / reserved
+
+        packet = new ReceiverFeedbackPacket(ssrc, lastSeq);
         return true;
     }
 

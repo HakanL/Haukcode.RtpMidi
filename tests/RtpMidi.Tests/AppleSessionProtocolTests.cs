@@ -19,7 +19,7 @@ public class AppleSessionProtocolTests
             Name: "Test Session");
 
         var encoded = AppleSessionProtocol.Encode(original);
-        var ok = AppleSessionProtocol.TryParse(encoded, out var parsed, out var clock);
+        var ok = AppleSessionProtocol.TryParse(encoded, out var parsed, out var clock, out _);
 
         Assert.True(ok);
         Assert.NotNull(parsed);
@@ -41,7 +41,7 @@ public class AppleSessionProtocolTests
             Name: "Bridge");
 
         var encoded = AppleSessionProtocol.Encode(original);
-        Assert.True(AppleSessionProtocol.TryParse(encoded, out var parsed, out _));
+        Assert.True(AppleSessionProtocol.TryParse(encoded, out var parsed, out _, out _));
         Assert.Equal(AppleSessionCommand.InvitationAccepted, parsed!.Command);
         Assert.Equal("Bridge", parsed.Name);
     }
@@ -57,7 +57,7 @@ public class AppleSessionProtocolTests
             Name: null);
 
         var encoded = AppleSessionProtocol.Encode(original);
-        Assert.True(AppleSessionProtocol.TryParse(encoded, out var parsed, out _));
+        Assert.True(AppleSessionProtocol.TryParse(encoded, out var parsed, out _, out _));
         Assert.Equal(AppleSessionCommand.EndSession, parsed!.Command);
     }
 
@@ -76,7 +76,7 @@ public class AppleSessionProtocolTests
             Timestamp3: 0);
 
         var encoded = AppleSessionProtocol.EncodeClock(original);
-        Assert.True(AppleSessionProtocol.TryParse(encoded, out _, out var parsed));
+        Assert.True(AppleSessionProtocol.TryParse(encoded, out _, out var parsed, out _));
         Assert.NotNull(parsed);
         Assert.Equal(0, parsed.Count);
         Assert.Equal(0x11223344u, parsed.Ssrc);
@@ -95,7 +95,7 @@ public class AppleSessionProtocolTests
             Timestamp3: 300_000);
 
         var encoded = AppleSessionProtocol.EncodeClock(original);
-        Assert.True(AppleSessionProtocol.TryParse(encoded, out _, out var parsed));
+        Assert.True(AppleSessionProtocol.TryParse(encoded, out _, out var parsed, out _));
         Assert.Equal(2, parsed!.Count);
         Assert.Equal(100_000ul, parsed.Timestamp1);
         Assert.Equal(200_000ul, parsed.Timestamp2);
@@ -110,7 +110,7 @@ public class AppleSessionProtocolTests
     public void Parse_RejectsShortBuffer()
     {
         var buf = new byte[] { 0xFF, 0xFF, 0x49 }; // truncated IN header
-        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _));
+        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _, out _));
     }
 
     [Fact]
@@ -119,7 +119,7 @@ public class AppleSessionProtocolTests
         var buf = new byte[20];
         buf[0] = 0x00; // wrong signature
         buf[1] = 0xFF;
-        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _));
+        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _, out _));
     }
 
     [Fact]
@@ -127,6 +127,39 @@ public class AppleSessionProtocolTests
     {
         // Valid signature + CK command but truncated body
         var buf = new byte[] { 0xFF, 0xFF, 0x43, 0x4B, 0x00, 0x00, 0x00, 0x00 };
-        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _));
+        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _, out _));
+    }
+
+    // -------------------------------------------------------------------------
+    // Receiver Feedback (RS)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ReceiverFeedback_ParsesCorrectly()
+    {
+        // Captured sample from issue: FF FF 52 53 48 D3 6A B5 8F 63 69 74
+        var buf = new byte[]
+        {
+            0xFF, 0xFF,             // magic
+            0x52, 0x53,             // 'RS'
+            0x48, 0xD3, 0x6A, 0xB5, // SSRC = 0x48D36AB5
+            0x8F, 0x63,             // last received sequence = 0x8F63
+            0x69, 0x74              // padding / reserved
+        };
+
+        Assert.True(AppleSessionProtocol.TryParse(buf, out var session, out var clock, out var feedback));
+        Assert.Null(session);
+        Assert.Null(clock);
+        Assert.NotNull(feedback);
+        Assert.Equal(0x48D36AB5u, feedback.Ssrc);
+        Assert.Equal(0x8F63, feedback.LastReceivedSequence);
+    }
+
+    [Fact]
+    public void ReceiverFeedback_RejectsShortBuffer()
+    {
+        // Valid signature + RS command but truncated body (only 8 bytes instead of 12)
+        var buf = new byte[] { 0xFF, 0xFF, 0x52, 0x53, 0x48, 0xD3, 0x6A, 0xB5 };
+        Assert.False(AppleSessionProtocol.TryParse(buf, out _, out _, out _));
     }
 }

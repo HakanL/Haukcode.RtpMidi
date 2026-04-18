@@ -441,7 +441,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
         {
             var result = await socket.ReceiveAsync(ct);
 
-            if (!AppleSessionProtocol.TryParse(result.Buffer, out var packet, out _) || packet == null)
+            if (!AppleSessionProtocol.TryParse(result.Buffer, out var packet, out _, out _) || packet == null)
                 continue;
 
             if (packet.Command != AppleSessionCommand.Invitation)
@@ -470,7 +470,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private static bool TryHandleSessionPacket(byte[] buffer, out SessionPacket? packet)
     {
         packet = null;
-        if (!AppleSessionProtocol.TryParse(buffer, out var p, out _))
+        if (!AppleSessionProtocol.TryParse(buffer, out var p, out _, out _))
             return false;
         packet = p;
         return packet != null;
@@ -489,13 +489,18 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 var result = await socket.ReceiveAsync(ct);
                 var buf    = result.Buffer;
 
-                if (AppleSessionProtocol.TryParse(buf, out var sessionPkt, out var clockPkt))
+                if (AppleSessionProtocol.TryParse(buf, out var sessionPkt, out var clockPkt, out var feedbackPkt))
                 {
                     if (clockPkt != null)
                     {
                         if (TraceHook != null)
                             TraceHook($"[{localName}] RX clock ({(isData ? "data" : "control")}) from {result.RemoteEndPoint}");
                         await HandleClockPacketAsync(socket, clockPkt, ct);
+                    }
+                    else if (feedbackPkt != null)
+                    {
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] RX session RS from {result.RemoteEndPoint} ssrc={feedbackPkt.Ssrc:X8} lastSeq={feedbackPkt.LastReceivedSequence}");
                     }
                     else if (sessionPkt != null)
                     {

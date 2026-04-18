@@ -329,17 +329,17 @@ public sealed class RtpMidiPacket
                 for (int j = 0; j < vlqLen; j++) buf.Add(vlqBuf[j]);
             }
 
-            byte status            = data[0];
-            bool isChannelOrSysEx  = status >= 0x80 && status < 0xF8; // Real-time never participates in running status
+            byte status           = data[0];
+            bool isChannelMessage = status >= 0x80 && status < 0xF0; // Only channel voice messages participate in running status
 
-            if (i == 0 && phantomStatus.HasValue && status == phantomStatus.Value && isChannelOrSysEx)
+            if (i == 0 && phantomStatus.HasValue && status == phantomStatus.Value && isChannelMessage)
             {
                 // Cross-packet running status (P flag): omit first command's status byte.
-                hasPhantom  = true;
+                hasPhantom    = true;
                 runningStatus = status;
                 for (int j = 1; j < data.Length; j++) buf.Add(data[j]);
             }
-            else if (i > 0 && runningStatus.HasValue && status == runningStatus.Value && isChannelOrSysEx && status < 0xF0)
+            else if (i > 0 && runningStatus.HasValue && status == runningStatus.Value && isChannelMessage)
             {
                 // Within-packet running status: omit redundant channel-status byte.
                 for (int j = 1; j < data.Length; j++) buf.Add(data[j]);

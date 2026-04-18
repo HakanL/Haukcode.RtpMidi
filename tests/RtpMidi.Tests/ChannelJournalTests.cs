@@ -425,7 +425,7 @@ public class ChannelJournalTests
         var bytes = state.EncodeChapterF(isLast: false);
         // Header(1) + 1(TC) + 2(SPP) + 1(SS) = 5
         Assert.Equal(5, bytes.Length);
-        // D=1, V=1, Q=1 → bits 6,5,4 → 0x70; S=0
+        // Header byte: S=0(isLast=false), D=1(0x40), V=1(0x20), Q=1(0x10) → 0x70
         Assert.Equal(0x70, bytes[0]);
 
         var recovered = new List<byte[]>();

@@ -214,7 +214,7 @@ internal static class RtpMidiJournal
         // Build system journal body
         byte[]? sysJournalBody = null;
         if (hasSystem)
-            sysJournalBody = BuildSystemJournalBody(hasSysF, hasSysEx, systemState, lastSysExPayload!);
+            sysJournalBody = BuildSystemJournalBody(hasSysF, hasSysEx, systemState, lastSysExPayload);
 
         // Build channel journal bodies
         byte[][]? chanJournalBodies = null;
@@ -416,14 +416,14 @@ internal static class RtpMidiJournal
         bool             hasSysF,
         bool             hasSysEx,
         SystemMidiState? systemState,
-        byte[]           lastSysExPayload)
+        byte[]?          lastSysExPayload)
     {
         // Chapter F data (if present)
         byte[]? chapterFBytes = hasSysF ? systemState!.EncodeChapterF(isLast: !hasSysEx) : null;
 
         // Chapter X data (if present)
         byte[]? chapterXBytes = null;
-        if (hasSysEx)
+        if (hasSysEx && lastSysExPayload != null)
         {
             int xLen       = lastSysExPayload.Length;
             bool isComplete = xLen > 0 && lastSysExPayload[xLen - 1] == 0xF7;

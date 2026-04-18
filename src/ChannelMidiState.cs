@@ -421,11 +421,10 @@ internal sealed class ChannelMidiState
         return 3;
     }
 
-    // Helper: bank fine is considered valid when B=1 and BF != 0 or when BC was active.
-    // RFC 6295 doesn't give a separate "bank fine valid" bit; we include it whenever
-    // B=1 and either the fine or coarse value is meaningful.
+    // Bank fine is always emitted together with bank coarse when B=1; the RFC does not
+    // provide a separate "bank fine valid" bit, so we always include both CC 0 and CC 32.
     private static bool HasBankFineFromChapterP(byte b0, byte b1, byte b2)
-        => (b0 & 0x40) != 0; // B flag — bank info is present; we always emit both CC 0 and CC 32 when B=1
+        => (b0 & 0x40) != 0; // B flag set — bank info is present
 
     /// <summary>
     /// Decodes Chapter C and appends the recovered Control Change messages
@@ -478,7 +477,10 @@ internal sealed class ChannelMidiState
 
         byte header = data[0];
         bool extendedBitfield = (header & 0x40) != 0; // B flag
-        if (extendedBitfield) return 1; // extended mode not yet supported — skip
+        // Extended bitfield mode (B=1) is not yet implemented; return -1 so the
+        // caller skips remaining chapters for this channel rather than misinterpreting
+        // the bitfield bytes as chapter data.
+        if (extendedBitfield) return -1;
 
         int count = header & 0x3F;
         int required = 1 + count * 2;

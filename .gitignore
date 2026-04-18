@@ -54,3 +54,4 @@ packages/
 *.lsv
 .vs
 launchSettings.json
+.claude

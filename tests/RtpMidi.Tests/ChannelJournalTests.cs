@@ -973,8 +973,11 @@ public class ChannelJournalTests
         state.ProcessMidi([0xC0, 5]);        // Program Change
         state.ProcessMidi([0xB0, 7, 127]);   // CC volume
         state.ProcessMidi([0xE0, 0x10, 0x40]); // Pitch Wheel
+        state.ProcessMidi([0xB0, 101, 0]);   // RPN MSB (Chapter M)
+        state.ProcessMidi([0xB0, 6, 2]);     // Data Entry MSB (Chapter M)
 
         Assert.True(state.HasAnyData);
+        Assert.True(state.HasParameterSystem);
 
         state.Reset();
 
@@ -986,6 +989,7 @@ public class ChannelJournalTests
         Assert.False(state.HasPitchWheel);
         Assert.False(state.HasChannelPressure);
         Assert.False(state.HasPolyPressure);
+        Assert.False(state.HasParameterSystem);
     }
 
     [Fact]

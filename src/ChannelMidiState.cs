@@ -148,6 +148,14 @@ internal sealed class ChannelMidiState
         HasPolyPressure  = false;
         Array.Clear(polyPressure,       0, polyPressure.Length);
         Array.Clear(polyPressureActive, 0, polyPressureActive.Length);
+        HasParameterSystem = false;
+        isNrpn           = false;
+        paramMsb         = 0;
+        paramLsb         = 0;
+        hasDataEntryMsb  = false;
+        hasDataEntryLsb  = false;
+        dataEntryMsb     = 0;
+        dataEntryLsb     = 0;
     }
 
     // -----------------------------------------------------------------------

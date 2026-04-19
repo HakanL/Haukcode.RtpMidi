@@ -154,6 +154,7 @@ The library implements the full RFC 6295 recovery journal on both the send and r
 | Channel | P | Program Change + Bank Select |
 | Channel | C | Control Change (all 128 controllers) |
 | Channel | W | Pitch Wheel |
+| Channel | M | RPN/NRPN Parameter System |
 | Channel | N | Note Off |
 | Channel | Q | Note On |
 | Channel | T | Channel Pressure |

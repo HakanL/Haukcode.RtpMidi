@@ -357,12 +357,15 @@ public sealed class RtpMidiSession : IRtpMidiSession
         int fragmentIndex = 0;
         foreach (var segment in BuildSysExFragments(midiBytes))
         {
-            // Build the recovery journal combining all accumulated state
+            // Build the recovery journal combining all accumulated state.
+            // The checkpoint is (sequenceNumber - 1): one before the current packet.
+            // This ensures that if the current packet is dropped, the NEXT packet's
+            // journal (with checkpoint = current sequenceNumber) will satisfy IsInGap.
             byte[]? journal = null;
             if (EnableRecoveryJournal)
             {
                 var j = RtpMidiJournal.EncodeFullJournal(
-                    lastSysExSeqNum, lastSysExPayload, channelStates, systemMidiState);
+                    (ushort)(sequenceNumber - 1), lastSysExPayload, channelStates, systemMidiState);
                 if (j.Length > 0) journal = j;
             }
 

@@ -3,7 +3,7 @@ using Haukcode.RtpMidi;
 namespace RtpMidi.Tests;
 
 /// <summary>
-/// Tests for recovery journal channel chapters V, P, C, W, N, Q, T, A
+/// Tests for recovery journal channel chapters V, P, C, M, W, N, Q, T, A
 /// and system chapter F (RFC 6295 Appendix A).
 /// </summary>
 public class ChannelJournalTests
@@ -165,6 +165,251 @@ public class ChannelJournalTests
         Assert.Equal(0, bytes[1] & 0x80);
         // Entry 2: SFLAG=1 (last)
         Assert.NotEqual(0, bytes[3] & 0x80);
+    }
+
+    // =========================================================================
+    // Chapter M — Parameter System (RPN/NRPN)
+    // =========================================================================
+
+    [Fact]
+    public void ChapterM_ProcessMidi_RPN_SetsHasParameterSystem()
+    {
+        var state = new ChannelMidiState();
+        Assert.False(state.HasParameterSystem);
+
+        state.ProcessMidi([0xB0, 101, 0]); // RPN MSB = 0
+        Assert.True(state.HasParameterSystem);
+    }
+
+    [Fact]
+    public void ChapterM_ProcessMidi_NRPN_SetsHasParameterSystem()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB0, 99, 2]); // NRPN MSB = 2
+
+        Assert.True(state.HasParameterSystem);
+    }
+
+    [Fact]
+    public void ChapterM_Encode_RPN_WithDataEntry_RoundTrip()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB = 0
+        state.ProcessMidi([0xB0, 100, 1]);  // RPN LSB = 1
+        state.ProcessMidi([0xB0, 6, 12]);   // Data Entry MSB = 12
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        // 2-byte header + PNUM_LSB + PNUM_MSB + flags + 1 data byte (CC6) = 6
+        Assert.Equal(6, bytes.Length);
+
+        // S=1 (isLast), U=1 (all RPN), length=6
+        // Header high byte: 0x80 | 0x10 | (6>>8)=0 → 0x90
+        Assert.Equal(0x90, bytes[0]);
+        // Header low byte: length & 0xFF = 6
+        Assert.Equal(6, bytes[1]);
+
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
+        Assert.Equal(6, consumed);
+        // Should emit: CC101(RPN MSB), CC100(RPN LSB), CC6(data entry)
+        Assert.Equal(3, recovered.Count);
+        Assert.Equal(new byte[] { 0xB0, 101, 0 }, recovered[0]);
+        Assert.Equal(new byte[] { 0xB0, 100, 1 }, recovered[1]);
+        Assert.Equal(new byte[] { 0xB0, 6, 12 }, recovered[2]);
+    }
+
+    [Fact]
+    public void ChapterM_Encode_RPN_WithDataEntryMsbAndLsb_RoundTrip()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB = 0
+        state.ProcessMidi([0xB0, 100, 0]);  // RPN LSB = 0 (Pitch Bend Sensitivity)
+        state.ProcessMidi([0xB0, 6, 2]);    // Data Entry MSB = 2 semitones
+        state.ProcessMidi([0xB0, 38, 0]);   // Data Entry LSB = 0
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        // 2-byte header + PNUM_LSB + PNUM_MSB + flags + 2 data bytes (CC6 + CC38) = 7
+        Assert.Equal(7, bytes.Length);
+
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
+        Assert.Equal(7, consumed);
+        Assert.Equal(4, recovered.Count);
+        Assert.Equal(new byte[] { 0xB0, 101, 0 }, recovered[0]);
+        Assert.Equal(new byte[] { 0xB0, 100, 0 }, recovered[1]);
+        Assert.Equal(new byte[] { 0xB0, 6, 2 }, recovered[2]);
+        Assert.Equal(new byte[] { 0xB0, 38, 0 }, recovered[3]);
+    }
+
+    [Fact]
+    public void ChapterM_Encode_NRPN_WithDataEntry_RoundTrip()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB0, 99, 5]);   // NRPN MSB = 5
+        state.ProcessMidi([0xB0, 98, 7]);   // NRPN LSB = 7
+        state.ProcessMidi([0xB0, 6, 64]);   // Data Entry MSB = 64
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        Assert.Equal(6, bytes.Length);
+
+        // W=1 (all NRPN) in high header byte: 0x80 | 0x08 | 0 = 0x88
+        Assert.Equal(0x88, bytes[0]);
+
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
+        Assert.Equal(6, consumed);
+        Assert.Equal(3, recovered.Count);
+        Assert.Equal(new byte[] { 0xB0, 99, 5 }, recovered[0]);  // NRPN MSB
+        Assert.Equal(new byte[] { 0xB0, 98, 7 }, recovered[1]);  // NRPN LSB
+        Assert.Equal(new byte[] { 0xB0, 6, 64 }, recovered[2]);  // Data Entry MSB
+    }
+
+    [Fact]
+    public void ChapterM_Encode_Channel3_CorrectStatusByte()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB3, 101, 0]);  // RPN MSB, channel 3
+        state.ProcessMidi([0xB3, 100, 0]);
+        state.ProcessMidi([0xB3, 6, 10]);
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        var recovered = new List<byte[]>();
+        ChannelMidiState.DecodeChapterM(bytes, 3, recovered);
+
+        Assert.All(recovered, m => Assert.Equal(0xB3, m[0]));
+    }
+
+    [Fact]
+    public void ChapterM_Decode_TooShort_ReturnsMinusOne()
+    {
+        var recovered = new List<byte[]>();
+        // Only 1 byte — need at least 2 for header
+        Assert.Equal(-1, ChannelMidiState.DecodeChapterM(new byte[1], 0, recovered));
+    }
+
+    [Fact]
+    public void ChapterM_NoDataEntry_OnlyParamSelect_Encodable()
+    {
+        // Parameter selected but no data entry yet — still has parameter system state
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB
+        state.ProcessMidi([0xB0, 100, 2]);  // RPN LSB
+
+        Assert.True(state.HasParameterSystem);
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        // 2-byte header + PNUM_LSB + PNUM_MSB + flags (no data bytes) = 5
+        Assert.Equal(5, bytes.Length);
+
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
+        Assert.Equal(5, consumed);
+        // Only the parameter select CCs
+        Assert.Equal(2, recovered.Count);
+        Assert.Equal(new byte[] { 0xB0, 101, 0 }, recovered[0]);
+        Assert.Equal(new byte[] { 0xB0, 100, 2 }, recovered[1]);
+    }
+
+    [Fact]
+    public void ChapterM_DataEntryResetOnNewParamSelect()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB
+        state.ProcessMidi([0xB0, 100, 0]);
+        state.ProcessMidi([0xB0, 6, 12]);   // Data Entry MSB
+
+        // Now select a new parameter — data entry should reset
+        state.ProcessMidi([0xB0, 101, 1]);  // New RPN MSB
+        state.ProcessMidi([0xB0, 100, 0]);
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        // No data entry for the new parameter: 2-byte header + PNUM_LSB + PNUM_MSB + flags = 5 bytes
+        Assert.Equal(5, bytes.Length);
+
+        var recovered = new List<byte[]>();
+        ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
+        // Only param select CCs, no CC6
+        Assert.Equal(2, recovered.Count);
+    }
+
+    [Fact]
+    public void ChapterM_IncludedInFullJournal_RoundTrip()
+    {
+        var states = new ChannelMidiState[16];
+        for (int i = 0; i < 16; i++) states[i] = new ChannelMidiState();
+
+        states[0].ProcessMidi([0xB0, 101, 0]);  // RPN MSB
+        states[0].ProcessMidi([0xB0, 100, 0]);  // RPN LSB (Pitch Bend Sensitivity)
+        states[0].ProcessMidi([0xB0, 6, 3]);    // Data Entry: 3 semitones
+
+        var journal = RtpMidiJournal.EncodeFullJournal(10, null, states, null);
+        Assert.NotEmpty(journal);
+
+        bool ok = RtpMidiJournal.TryParseFullJournal(journal, out var cp, out var recovered);
+        Assert.True(ok);
+        Assert.Equal(10, cp);
+        Assert.NotNull(recovered);
+
+        // Should contain: RPN MSB (CC101=0), RPN LSB (CC100=0), Data Entry (CC6=3)
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0xB0, 101, 0 }));
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0xB0, 100, 0 }));
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0xB0, 6, 3 }));
+    }
+
+    [Fact]
+    public void PacketLossRecovery_RPN_RestoredFromJournal()
+    {
+        // Packet 0: Note On (no journal)
+        // Packet 1: RPN select + data entry + journal  — DROPPED
+        // Packet 2: Note On + journal (same checkpoint=1) — received
+        // Gap detection should recover the RPN state from pkt2's journal.
+
+        var pkt0 = RtpMidiPacket.Encode(0xAA, 0, 0, new byte[] { 0x90, 48, 50 });
+
+        var states = new ChannelMidiState[16];
+        for (int i = 0; i < 16; i++) states[i] = new ChannelMidiState();
+        states[0].ProcessMidi([0xB0, 101, 0]);  // RPN MSB
+        states[0].ProcessMidi([0xB0, 100, 0]);  // RPN LSB (Pitch Bend Sensitivity)
+        states[0].ProcessMidi([0xB0, 6, 2]);    // Data Entry: 2 semitones
+
+        var journal = RtpMidiJournal.EncodeFullJournal(1, null, states, null);
+        // pkt1 (dropped) carries the RPN change; pkt2 carries the same journal
+        var pkt2 = RtpMidiPacket.Encode(0xAA, 2, 200, new byte[] { 0x90, 60, 100 }, journal);
+
+        var received = new List<byte[]>();
+        ushort? expectedSeq = null;
+
+        foreach (var raw in new[] { pkt0, /* pkt1 dropped */ pkt2 })
+        {
+            Assert.True(RtpMidiPacket.TryParse(raw, out var pkt));
+            Assert.NotNull(pkt);
+
+            if (expectedSeq.HasValue && pkt!.SequenceNumber != expectedSeq.Value)
+            {
+                if (!pkt.JournalBytes.IsEmpty
+                    && RtpMidiJournal.TryParseFullJournal(
+                        pkt.JournalBytes.Span,
+                        out var cpSeq,
+                        out var recovered)
+                    && recovered != null
+                    && IsInGap(cpSeq, expectedSeq.Value, pkt.SequenceNumber))
+                {
+                    received.AddRange(recovered);
+                }
+            }
+
+            expectedSeq = (ushort)(pkt!.SequenceNumber + 1);
+            if (!pkt.MidiBytes.IsEmpty)
+                received.Add(pkt.MidiBytes.ToArray());
+        }
+
+        // The recovered stream must contain the RPN parameter setup
+        Assert.Contains(received, m => m.SequenceEqual(new byte[] { 0xB0, 101, 0 }));
+        Assert.Contains(received, m => m.SequenceEqual(new byte[] { 0xB0, 100, 0 }));
+        Assert.Contains(received, m => m.SequenceEqual(new byte[] { 0xB0, 6, 2 }));
+        // Plus the original note and pkt2's note
+        Assert.Contains(received, m => m.SequenceEqual(new byte[] { 0x90, 48, 50 }));
+        Assert.Contains(received, m => m.SequenceEqual(new byte[] { 0x90, 60, 100 }));
     }
 
     // =========================================================================

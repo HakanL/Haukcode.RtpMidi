@@ -2,7 +2,7 @@ namespace Haukcode.RtpMidi;
 
 /// <summary>
 /// Tracks the per-channel MIDI state required to encode recovery journal chapters
-/// P, C, W, N, Q, T, and A (RFC 6295 Appendix A).
+/// P, C, M, W, N, Q, T, and A (RFC 6295 Appendix A).
 ///
 /// Updated each time a MIDI message is sent on this channel.  The accumulated
 /// state is serialised into a channel journal by
@@ -96,12 +96,27 @@ internal sealed class ChannelMidiState
     public bool HasPolyPressure { get; private set; }
 
     // -----------------------------------------------------------------------
+    // Chapter M — Parameter System (RPN/NRPN)
+    // -----------------------------------------------------------------------
+
+    private bool isNrpn;
+    private byte paramMsb;
+    private byte paramLsb;
+    private bool hasDataEntryMsb;
+    private bool hasDataEntryLsb;
+    private byte dataEntryMsb;
+    private byte dataEntryLsb;
+
+    /// <summary>True when RPN/NRPN parameter-system state has been accumulated on this channel.</summary>
+    public bool HasParameterSystem { get; private set; }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
     /// <summary>Returns true if any chapter data has been accumulated since the last reset.</summary>
     public bool HasAnyData =>
-        HasProgram || HasControlChange || HasPitchWheel ||
+        HasProgram || HasControlChange || HasParameterSystem || HasPitchWheel ||
         HasNoteOff || HasNoteOn || HasChannelPressure || HasPolyPressure;
 
     /// <summary>
@@ -209,6 +224,32 @@ internal sealed class ChannelMidiState
                     // Mirror bank select into Chapter P fields
                     if (cc == 0)  { BankCoarse = val; HasBankCoarse = true; }
                     if (cc == 32) { BankFine   = val; HasBankFine   = true; }
+                    // Parameter system tracking (Chapter M)
+                    switch (cc)
+                    {
+                        case 99:  // NRPN MSB — start NRPN selection, reset data-entry
+                            isNrpn = true; paramMsb = val;
+                            hasDataEntryMsb = false; hasDataEntryLsb = false;
+                            HasParameterSystem = true;
+                            break;
+                        case 101: // RPN MSB — start RPN selection, reset data-entry
+                            isNrpn = false; paramMsb = val;
+                            hasDataEntryMsb = false; hasDataEntryLsb = false;
+                            HasParameterSystem = true;
+                            break;
+                        case 98:  // NRPN LSB
+                            if (isNrpn) { paramLsb = val; }
+                            break;
+                        case 100: // RPN LSB
+                            if (!isNrpn) { paramLsb = val; }
+                            break;
+                        case 6:   // Data Entry MSB
+                            if (HasParameterSystem) { dataEntryMsb = val; hasDataEntryMsb = true; }
+                            break;
+                        case 38:  // Data Entry LSB
+                            if (HasParameterSystem) { dataEntryLsb = val; hasDataEntryLsb = true; }
+                            break;
+                    }
                 }
                 break;
 
@@ -421,6 +462,73 @@ internal sealed class ChannelMidiState
         return buf;
     }
 
+    /// <summary>
+    /// Encodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.1.
+    ///
+    /// Wire layout:
+    ///   2-byte header (big-endian 16-bit):
+    ///     Bit 15: S (last chapter)
+    ///     Bit 14: P = 0 (not pending)
+    ///     Bit 13: E = 0
+    ///     Bit 12: U = 1 if all entries are RPN
+    ///     Bit 11: W = 1 if all entries are NRPN
+    ///     Bit 10: Z = 0
+    ///     Bits 9-0: total chapter size in bytes (including header)
+    ///   Log list (one entry per active RPN/NRPN parameter):
+    ///     Byte: S(last=0x80) | PNUM_LSB[6:0]
+    ///     Byte: Q(NRPN=0x80) | PNUM_MSB[6:0]
+    ///     Byte: J(0x80)|K(0x40)|… flags
+    ///     If J: Byte data-entry MSB (CC6 value)
+    ///     If K: Byte data-entry LSB (CC38 value)
+    /// </summary>
+    public byte[] EncodeChapterM(bool isLast)
+    {
+        // Build the single log item for the current parameter
+        byte flagsByte = 0;
+        if (hasDataEntryMsb) flagsByte |= 0x80; // J
+        if (hasDataEntryLsb) flagsByte |= 0x40; // K
+
+        // Log item size: PNUM_LSB + PNUM_MSB + flags + optional data bytes
+        int itemSize = 3
+            + (hasDataEntryMsb ? 1 : 0)
+            + (hasDataEntryLsb ? 1 : 0);
+
+        // Total chapter size = 2-byte header + log item
+        int totalSize = 2 + itemSize;
+
+        var buf = new byte[totalSize];
+
+        // 2-byte header (big-endian)
+        ushort hdr = (ushort)(
+            (isLast ? 0x8000 : 0)       // S
+            | (isNrpn ? 0 : 0x1000)     // U: all-RPN hint
+            | (isNrpn ? 0x0800 : 0)     // W: all-NRPN hint
+            | (totalSize & 0x03FF));    // Length (bits 9:0)
+        buf[0] = (byte)(hdr >> 8);
+        buf[1] = (byte)(hdr & 0xFF);
+
+        int off = 2;
+
+        // Log item: PNUM_LSB byte (S=1 because this is the last/only item in the log)
+        buf[off++] = (byte)(0x80 | (paramLsb & 0x7F));
+
+        // Log item: PNUM_MSB byte (Q=1 if NRPN)
+        buf[off++] = (byte)((isNrpn ? 0x80 : 0) | (paramMsb & 0x7F));
+
+        // Log item: flags byte
+        buf[off++] = flagsByte;
+
+        // Optional data-entry MSB (CC6)
+        if (hasDataEntryMsb)
+            buf[off++] = (byte)(dataEntryMsb & 0x7F);
+
+        // Optional data-entry LSB (CC38)
+        if (hasDataEntryLsb)
+            buf[off++] = (byte)(dataEntryLsb & 0x7F);
+
+        return buf;
+    }
+
     // -----------------------------------------------------------------------
     // Chapter decoding  (static: parse bytes → MIDI messages)
     // -----------------------------------------------------------------------
@@ -593,6 +701,115 @@ internal sealed class ChannelMidiState
         }
 
         return required;
+    }
+
+    /// <summary>
+    /// Decodes Chapter M (Parameter System: RPN/NRPN) and appends the recovered
+    /// Control Change messages to <paramref name="recovered"/>.
+    /// Returns the number of bytes consumed, or -1 on error.
+    /// </summary>
+    public static int DecodeChapterM(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
+    {
+        // Need at least the 2-byte chapter header
+        if (data.Length < 2) return -1;
+
+        ushort header  = (ushort)((data[0] << 8) | data[1]);
+        bool   pending = (header & 0x4000) != 0;
+        bool   hasZ    = (header & 0x0400) != 0;
+        bool   hasU    = (header & 0x1000) != 0; // all-RPN hint
+        bool   hasW    = (header & 0x0800) != 0; // all-NRPN hint
+        int    length  = header & 0x03FF;        // total chapter size including header
+
+        if (length < 2 || data.Length < length) return -1;
+
+        int pos = 2;
+
+        // Skip the optional pending byte
+        if (pending)
+        {
+            if (pos >= length) return length;
+            pos++;
+        }
+
+        // Z optimization: PNUM_MSB is omitted from each log item when all entries
+        // share the same PNUM_MSB (RFC 6295 §A.1). Our encoder always sets Z=0 so
+        // we never generate this format, but we parse it defensively for interoperability.
+        // When Z=1 and all entries are the same parameter type (U or W set), the
+        // PNUM_MSB is shared and would be in the pending byte; here we default it to 0.
+        bool noPnumMsb = hasZ && (hasU || hasW);
+
+        byte status = (byte)(0xB0 | (channel & 0x0F));
+
+        // Walk the log list
+        while (pos < length)
+        {
+            // Log item: PNUM_LSB byte (bit 7 = S flag "last item")
+            byte pnumLsb = (byte)(data[pos] & 0x7F);
+            pos++;
+
+            // Log item: PNUM_MSB byte (bit 7 = Q flag "NRPN")
+            byte pnumMsb = 0;
+            bool itemIsNrpn = hasW; // default from chapter-level W hint
+            if (!noPnumMsb)
+            {
+                if (pos >= length) return -1;
+                itemIsNrpn = (data[pos] & 0x80) != 0;
+                pnumMsb    = (byte)(data[pos] & 0x7F);
+                pos++;
+            }
+
+            // Log item: flags byte (J=0x80, K=0x40, L=0x20, M=0x10, N=0x08, T=0x04, V=0x02, R=0x01)
+            if (pos >= length) return -1;
+            byte flags = data[pos++];
+            bool flagJ = (flags & 0x80) != 0; // data-entry MSB (CC6)
+            bool flagK = (flags & 0x40) != 0; // data-entry LSB (CC38)
+            bool flagL = (flags & 0x20) != 0; // a-button (2 bytes)
+            bool flagM = (flags & 0x10) != 0; // c-button (2 bytes)
+            bool flagN = (flags & 0x08) != 0; // count    (1 byte)
+
+            // Optional data-entry MSB
+            byte entryMsb = 0;
+            if (flagJ)
+            {
+                if (pos >= length) return -1;
+                entryMsb = (byte)(data[pos++] & 0x7F);
+            }
+
+            // Optional data-entry LSB
+            byte entryLsb = 0;
+            if (flagK)
+            {
+                if (pos >= length) return -1;
+                entryLsb = (byte)(data[pos++] & 0x7F);
+            }
+
+            // Skip a-button (L flag, 2 bytes)
+            if (flagL) { pos += 2; }
+
+            // Skip c-button (M flag, 2 bytes)
+            if (flagM) { pos += 2; }
+
+            // Skip count (N flag, 1 byte)
+            if (flagN) { pos += 1; }
+
+            // Reconstruct the CC sequence:
+            //   CC99+CC98 (NRPN) or CC101+CC100 (RPN), then CC6 and/or CC38
+            if (itemIsNrpn)
+            {
+                recovered.Add([status, 99,  pnumMsb]);  // NRPN MSB
+                recovered.Add([status, 98,  pnumLsb]);  // NRPN LSB
+            }
+            else
+            {
+                recovered.Add([status, 101, pnumMsb]);  // RPN MSB
+                recovered.Add([status, 100, pnumLsb]);  // RPN LSB
+            }
+
+            if (flagJ) recovered.Add([status, 6,  entryMsb]); // Data Entry MSB
+            if (flagK) recovered.Add([status, 38, entryLsb]); // Data Entry LSB
+        }
+
+        return length;
     }
 }
 

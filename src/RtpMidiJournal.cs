@@ -5,7 +5,7 @@ namespace Haukcode.RtpMidi;
 ///
 /// Supported chapters:
 ///   System journal: Chapter X (SysEx, §A.3), Chapter F (System Common, §A.11)
-///   Channel journal: Chapter V (header, §A.1), P (§A.7), C (§A.4), W (§A.6),
+///   Channel journal: Chapter V (header, §A.1), P (§A.7), C (§A.4), M (§A.1), W (§A.6),
 ///                    N (§A.5), Q (§A.8), T (§A.9), A (§A.2)
 ///
 /// Wire layout of the journal appended after the MIDI command section:
@@ -28,7 +28,7 @@ namespace Haukcode.RtpMidi;
 ///       Byte 0: S|CHAN[3:0]|H|LEN_HI[1:0]   S=1 on last channel journal
 ///       Byte 1: LEN_LO[7:0]
 ///       Byte 2: P|C|M|W|N|Q|T|A  chapter presence flags
-///     Chapters in order: P, C, W, N, Q, T, A  (M not implemented)
+///     Chapters in order: P, C, M, W, N, Q, T, A
 /// </summary>
 internal static class RtpMidiJournal
 {
@@ -50,6 +50,7 @@ internal static class RtpMidiJournal
     // Chapter V (§A.1) presence byte bit positions
     private const byte ChapVFlagP = 0x80; // Program Change
     private const byte ChapVFlagC = 0x40; // Control Change
+    private const byte ChapVFlagM = 0x20; // Parameter System (RPN/NRPN)
     private const byte ChapVFlagW = 0x10; // Pitch Wheel
     private const byte ChapVFlagN = 0x08; // Note Off
     private const byte ChapVFlagQ = 0x04; // Note On
@@ -171,7 +172,7 @@ internal static class RtpMidiJournal
 
     /// <summary>
     /// Encodes a complete recovery journal combining system chapters (F, X) and
-    /// channel chapters (V+P+C+W+N+Q+T+A) for all channels that have accumulated state.
+    /// channel chapters (V+P+C+M+W+N+Q+T+A) for all channels that have accumulated state.
     /// </summary>
     /// <param name="checkpointSeqNum">Checkpoint packet sequence number.</param>
     /// <param name="lastSysExPayload">
@@ -365,6 +366,13 @@ internal static class RtpMidiJournal
                     cpos += n;
                 }
 
+                if ((vb2 & ChapVFlagM) != 0)
+                {
+                    int n = ChannelMidiState.DecodeChapterM(chapData[cpos..], channel, recovered);
+                    if (n < 0) break;
+                    cpos += n;
+                }
+
                 if ((vb2 & ChapVFlagW) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterW(chapData[cpos..], channel, recovered);
@@ -461,6 +469,7 @@ internal static class RtpMidiJournal
         // Determine which chapters are present and encode them
         bool hasP = state.HasProgram;
         bool hasC = state.HasControlChange;
+        bool hasM = state.HasParameterSystem;
         bool hasW = state.HasPitchWheel;
         bool hasN = state.HasNoteOff;
         bool hasQ = state.HasNoteOn;
@@ -468,23 +477,25 @@ internal static class RtpMidiJournal
         bool hasA = state.HasPolyPressure;
 
         // Encode each chapter, noting which is the last (sets its S flag)
-        // Chapter order: P, C, W, N, Q, T, A  (M not implemented)
-        bool[] present = [hasP, hasC, hasW, hasN, hasQ, hasT, hasA];
+        // Chapter order: P, C, M, W, N, Q, T, A
+        bool[] present = [hasP, hasC, hasM, hasW, hasN, hasQ, hasT, hasA];
         int lastIdx = -1;
         for (int i = present.Length - 1; i >= 0; i--) { if (present[i]) { lastIdx = i; break; } }
 
         byte[]? pBytes = hasP ? state.EncodeChapterP(isLast: lastIdx == 0) : null;
         byte[]? cBytes = hasC ? state.EncodeChapterC(isLast: lastIdx == 1) : null;
-        byte[]? wBytes = hasW ? state.EncodeChapterW(isLast: lastIdx == 2) : null;
-        byte[]? nBytes = hasN ? state.EncodeChapterN(isLast: lastIdx == 3) : null;
-        byte[]? qBytes = hasQ ? state.EncodeChapterQ(isLast: lastIdx == 4) : null;
-        byte[]? tBytes = hasT ? state.EncodeChapterT(isLast: lastIdx == 5) : null;
-        byte[]? aBytes = hasA ? state.EncodeChapterA(isLast: lastIdx == 6) : null;
+        byte[]? mBytes = hasM ? state.EncodeChapterM(isLast: lastIdx == 2) : null;
+        byte[]? wBytes = hasW ? state.EncodeChapterW(isLast: lastIdx == 3) : null;
+        byte[]? nBytes = hasN ? state.EncodeChapterN(isLast: lastIdx == 4) : null;
+        byte[]? qBytes = hasQ ? state.EncodeChapterQ(isLast: lastIdx == 5) : null;
+        byte[]? tBytes = hasT ? state.EncodeChapterT(isLast: lastIdx == 6) : null;
+        byte[]? aBytes = hasA ? state.EncodeChapterA(isLast: lastIdx == 7) : null;
 
         // Total chapter payload length (excluding the 3-byte Chapter V header)
         int chapLen = 0;
         if (pBytes != null) chapLen += pBytes.Length;
         if (cBytes != null) chapLen += cBytes.Length;
+        if (mBytes != null) chapLen += mBytes.Length;
         if (wBytes != null) chapLen += wBytes.Length;
         if (nBytes != null) chapLen += nBytes.Length;
         if (qBytes != null) chapLen += qBytes.Length;
@@ -495,6 +506,7 @@ internal static class RtpMidiJournal
         byte presence = 0;
         if (hasP) presence |= ChapVFlagP;
         if (hasC) presence |= ChapVFlagC;
+        if (hasM) presence |= ChapVFlagM;
         if (hasW) presence |= ChapVFlagW;
         if (hasN) presence |= ChapVFlagN;
         if (hasQ) presence |= ChapVFlagQ;
@@ -516,6 +528,7 @@ internal static class RtpMidiJournal
         int off = 3;
         if (pBytes != null) { pBytes.CopyTo(journal, off); off += pBytes.Length; }
         if (cBytes != null) { cBytes.CopyTo(journal, off); off += cBytes.Length; }
+        if (mBytes != null) { mBytes.CopyTo(journal, off); off += mBytes.Length; }
         if (wBytes != null) { wBytes.CopyTo(journal, off); off += wBytes.Length; }
         if (nBytes != null) { nBytes.CopyTo(journal, off); off += nBytes.Length; }
         if (qBytes != null) { qBytes.CopyTo(journal, off); off += qBytes.Length; }

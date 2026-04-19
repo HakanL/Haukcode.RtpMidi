@@ -12,9 +12,10 @@ Enables bidirectional MIDI over IP — receive notes, CC, program changes, and s
 ## Features
 
 - Full Apple MIDI session protocol (IN / OK / NO / BY / CK)
-- Both **initiator** and **responder** roles
+- Both **initiator** and **responder** roles, with optional auto-reconnect
 - Clock sync (3-way CK exchange) — required by hardware bridges
 - RTP-MIDI packet encoding/decoding (RFC 6295)
+- Full RFC 6295 recovery journal — system chapters X (SysEx) and F (System Common), plus all channel chapters (Program Change, Control Change, Pitch Wheel, Note On/Off, Channel Pressure, Poly Key Pressure)
 - `IObservable<T>` streams via **System.Reactive** for received MIDI and state changes
 - Cross-platform: Windows, Linux (including ARM64), macOS
 - Zero platform-specific code — pure managed C#
@@ -81,6 +82,20 @@ session.MidiReceived.Subscribe(HandleMidi);
 await session.ListenAsync(controlPort: 5004);
 ```
 
+### Auto-reconnect
+
+Both roles have reconnecting variants that loop until cancellation:
+
+```csharp
+using var cts = new CancellationTokenSource();
+
+// Reconnects every 5 s if the session drops
+await session.ConnectWithReconnectAsync(endpoint, TimeSpan.FromSeconds(5), cts.Token);
+
+// Re-listens after each session ends
+await session.ListenWithReconnectAsync(controlPort: 5004, TimeSpan.FromMilliseconds(500), cts.Token);
+```
+
 ### Discover peers via mDNS (requires Haukcode.RtpMidi.Mdns)
 
 ```csharp
@@ -126,24 +141,34 @@ RTP-MIDI uses two UDP ports per session:
 
 The clock sync exchange (CK0 → CK1 → CK2) is **mandatory** — hardware bridges will not confirm the connection until it completes. This library implements the full 3-way exchange and repeats it every ~10 seconds to maintain the session.
 
-### Journal (RFC 6295 §4 / §A.3)
+### Recovery Journal (RFC 6295 §4 / §A)
 
-The library implements **Chapter X (System Exclusive) journal recovery** per RFC 6295 §A.3.
+The library implements the full RFC 6295 recovery journal on both the send and receive sides.
 
-When a SysEx message is sent, the session automatically buffers it and appends a recovery journal to every subsequent outgoing packet. The journal carries the last complete SysEx payload so that a receiver who missed the original packet can reconstruct it from the next packet it receives, without audible glitches or session tears.
+**Covered chapters:**
 
-On the receive side the session tracks sequence numbers. When a gap is detected, the incoming packet's journal is consulted and any recovered SysEx is emitted to `MidiReceived` subscribers before the current packet's MIDI data.
+| Scope | Chapter | Content |
+|-------|---------|---------|
+| System | X | System Exclusive (SysEx) |
+| System | F | System Common messages |
+| Channel | P | Program Change + Bank Select |
+| Channel | C | Control Change (all 128 controllers) |
+| Channel | W | Pitch Wheel |
+| Channel | N | Note Off |
+| Channel | Q | Note On |
+| Channel | T | Channel Pressure |
+| Channel | A | Poly Key Pressure |
 
-This is the key feature that prevents Apple CoreMIDI (macOS) from dropping sessions that transport SysEx.
+On the send side, each outgoing packet carries a journal encoding the most-recent state for every active channel and any buffered SysEx, so a receiver who missed a packet can reconstruct the lost events from the next packet it receives.
 
-**Configuration**:
+On the receive side, sequence numbers are tracked; when a gap is detected the incoming packet's journal is consulted and any recovered events are emitted to `MidiReceived` subscribers before the current packet's MIDI data.
+
+**Configuration:**
 
 ```csharp
 // Enabled by default; disable only on strictly loss-free paths
 session.EnableRecoveryJournal = false;
 ```
-
-Channel-message journal chapters (N, V, C, E, T, …) are not yet implemented but can be added incrementally — Chapter X is the one that unblocks Apple interop.
 
 ---
 

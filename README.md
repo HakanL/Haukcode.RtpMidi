@@ -15,7 +15,7 @@ Enables bidirectional MIDI over IP — receive notes, CC, program changes, and s
 - Both **initiator** and **responder** roles, with optional auto-reconnect
 - Clock sync (3-way CK exchange) — required by hardware bridges
 - RTP-MIDI packet encoding/decoding (RFC 6295)
-- Full RFC 6295 recovery journal — system chapters X (SysEx) and F (System Common), plus all channel chapters (Program Change, Control Change, Pitch Wheel, Note On/Off, Channel Pressure, Poly Key Pressure)
+- Full RFC 6295 recovery journal — system chapters X (SysEx) and F (System Common), plus all channel chapters (Program Change, Control Change, Pitch Wheel, Note Off, Note On, Channel Pressure, Poly Key Pressure, RPN/NRPN Parameter System)
 - `IObservable<T>` streams via **System.Reactive** for received MIDI and state changes
 - Cross-platform: Windows, Linux (including ARM64), macOS
 - Zero platform-specific code — pure managed C#
@@ -154,6 +154,7 @@ The library implements the full RFC 6295 recovery journal on both the send and r
 | Channel | P | Program Change + Bank Select |
 | Channel | C | Control Change (all 128 controllers) |
 | Channel | W | Pitch Wheel |
+| Channel | M | RPN/NRPN Parameter System |
 | Channel | N | Note Off |
 | Channel | Q | Note On |
 | Channel | T | Channel Pressure |

@@ -6,6 +6,7 @@ RTP-MIDI (RFC 6295) for .NET — bidirectional MIDI over IP with full Apple MIDI
 
 - Apple MIDI session protocol (IN/OK/NO/BY/CK) — both initiator and responder roles
 - Mandatory clock sync (CK0→CK1→CK2) — compatible with hardware bridges
+- Full RFC 6295 recovery journal (all channel chapters P/C/M/W/N/Q/T/A and system chapters X/F) — packet-loss recovery without session drops
 - `IObservable<T>` streams for received MIDI and state changes (System.Reactive)
 - Cross-platform: Windows, Linux ARM64, macOS — pure managed C#
 

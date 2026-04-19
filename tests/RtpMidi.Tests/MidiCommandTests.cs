@@ -365,6 +365,50 @@ public class MidiCommandTests
         Assert.Equal(new byte[] { 0x90, 0x40, 0x64 }, decoded[2].Data.ToArray());
     }
 
+    [Fact]
+    public void SystemCommon_CancelsRunningStatus_ChannelMessageAfterNeedsStatus()
+    {
+        // System Common messages (0xF1–0xF6) must cancel running status.
+        // A channel message following a system common message must include its status byte.
+        var commands = new List<MidiCommand>
+        {
+            new(0u, new byte[] { 0x90, 0x3C, 0x7F }), // Note On — establishes running status 0x90
+            new(0u, new byte[] { 0xF2, 0x00, 0x00 }), // Song Position Pointer — cancels running status
+            new(0u, new byte[] { 0x90, 0x40, 0x64 }), // Note On — must include status byte
+        };
+
+        var (midiSection, _, _) = RtpMidiPacket.EncodeCommandSection(commands, null);
+
+        // Decode and verify all three commands are restored with correct status bytes.
+        var decoded = RtpMidiPacket.DecodeCommandSection(midiSection, hasDelta: true, hasPhantom: false, phantomStatus: null);
+        Assert.Equal(3, decoded.Count);
+        Assert.Equal(new byte[] { 0x90, 0x3C, 0x7F }, decoded[0].Data.ToArray());
+        Assert.Equal(new byte[] { 0xF2, 0x00, 0x00 }, decoded[1].Data.ToArray());
+        Assert.Equal(new byte[] { 0x90, 0x40, 0x64 }, decoded[2].Data.ToArray());
+    }
+
+    [Fact]
+    public void SystemCommon_AfterChannelMsg_FullRoundTrip()
+    {
+        // Verify encode+decode round-trip for a mixed command list containing
+        // a system common message between two Note On commands.
+        var commands = new List<MidiCommand>
+        {
+            new(0u,   new byte[] { 0x90, 0x3C, 0x7F }),  // Note On
+            new(10u,  new byte[] { 0xF3, 0x05 }),         // Song Select (system common)
+            new(20u,  new byte[] { 0x90, 0x40, 0x64 }),   // Note On — must carry status byte
+        };
+
+        var encoded = RtpMidiPacket.Encode(0x01, 1, 0, commands);
+        Assert.True(RtpMidiPacket.TryParse(encoded, out var pkt));
+
+        var decoded = pkt!.DecodeCommands();
+        Assert.Equal(3, decoded.Count);
+        Assert.Equal(new byte[] { 0x90, 0x3C, 0x7F }, decoded[0].Data.ToArray());
+        Assert.Equal(new byte[] { 0xF3, 0x05 },        decoded[1].Data.ToArray());
+        Assert.Equal(new byte[] { 0x90, 0x40, 0x64 }, decoded[2].Data.ToArray());
+    }
+
     // -------------------------------------------------------------------------
     // Empty / edge cases
     // -------------------------------------------------------------------------

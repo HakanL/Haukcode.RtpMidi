@@ -212,6 +212,70 @@ public class RtpMidiJournalTests
         Assert.Equal(noteoff, received[2]);
     }
 
+    /// <summary>
+    /// Validates the fix for the channel-message journal checkpoint bug.
+    ///
+    /// Previously the checkpoint in channel-only journals was always 0 (the default
+    /// of lastSysExSeqNum), which caused IsInGap to return false for any realistic
+    /// sequence number, silently suppressing recovery.
+    ///
+    /// After the fix, the journal checkpoint is (sequenceNumber - 1) — one before the
+    /// current packet — so that a receiver detecting a gap at seq N sees checkpoint N
+    /// in the *next* packet's journal and correctly applies recovery.
+    ///
+    /// Scenario:
+    ///   Packet 10 — CC Volume on ch 0 (dropped)
+    ///   Packet 11 — Note On on ch 0, journal (C=10) carries CC Volume state
+    ///   Receiver: expected seq=10, receives seq=11 → gap [10,10] → recovers CC Volume
+    /// </summary>
+    [Fact]
+    public void PacketLossRecovery_ChannelMsgRecoveredFromJournal()
+    {
+        byte channel = 0;
+
+        // Build the MIDI state that would exist at the time packet 11 is sent:
+        //   CC Volume from packet 10 (accumulated state)
+        //   Note On from packet 11 (current packet's own message, also accumulated)
+        var chState = new ChannelMidiState();
+        chState.ProcessMidi([(byte)(0xB0 | channel), 7, 100]);   // CC Volume (from dropped pkt 10)
+        chState.ProcessMidi([(byte)(0x90 | channel), 0x3C, 0x7F]); // Note On  (from pkt 11)
+
+        var channelStates16 = new ChannelMidiState[16];
+        for (int i = 0; i < 16; i++) channelStates16[i] = new ChannelMidiState();
+        channelStates16[channel] = chState;
+
+        // Packet 11: Note On MIDI payload, journal checkpoint = 10 (= sequenceNumber - 1 = 11 - 1)
+        var journal11 = RtpMidiJournal.EncodeFullJournal(10, null, channelStates16, null);
+        var pkt11 = RtpMidiPacket.Encode(0xAA, 11, 1100, new byte[] { (byte)(0x90 | channel), 0x3C, 0x7F }, journal11);
+
+        // Simulate receiver: expected seq=10 (has received up to seq=9), gets seq=11
+        ushort expectedSeq = 10;
+        var received = new List<byte[]>();
+
+        Assert.True(RtpMidiPacket.TryParse(pkt11, out var p));
+        var pkt = p!;
+
+        // Gap detected: 11 ≠ 10
+        Assert.NotEqual(expectedSeq, pkt.SequenceNumber);
+
+        // Consult journal
+        Assert.True(RtpMidiJournal.TryParseFullJournal(pkt.JournalBytes.Span, out var cpSeq, out var msgs));
+        Assert.NotNull(msgs);
+
+        // IsInGap(10, 10, 11) = (10-10) < (11-10) = 0 < 1 = TRUE
+        Assert.True(IsInGap(cpSeq, expectedSeq, pkt.SequenceNumber),
+            $"checkpoint {cpSeq} should be in gap [{expectedSeq},{pkt.SequenceNumber})");
+
+        received.AddRange(msgs!);
+        if (!pkt.MidiBytes.IsEmpty)
+            received.Add(pkt.MidiBytes.ToArray());
+
+        // Recovered messages include CC Volume (from Chapter C) and Note On (from Chapter Q),
+        // plus Note On again from the packet's own MIDI payload.
+        // Key assertion: CC Volume (from dropped packet 10) was recovered.
+        Assert.Contains(received, m => m.SequenceEqual(new byte[] { (byte)(0xB0 | channel), 7, 100 }));
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

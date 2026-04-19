@@ -366,10 +366,12 @@ public sealed class RtpMidiPacket
             {
                 // Include the full command.
                 for (int j = 0; j < data.Length; j++) buf.Add(data[j]);
-                // Update running status (channel messages only; SysEx resets it).
+                // Update running status: channel messages (0x80–0xEF) establish it;
+                // SysEx and system common (0xF0–0xF7) cancel it;
+                // real-time (0xF8–0xFF) leave it unchanged.
                 if (status >= 0x80 && status < 0xF0)
                     runningStatus = status;
-                else if (status == 0xF0 || status == 0xF7)
+                else if (status < 0xF8)
                     runningStatus = null;
             }
         }
@@ -411,8 +413,8 @@ public sealed class RtpMidiPacket
                 // P=1: first command has no status byte; use phantom status.
                 status         = phantomStatus.Value;
                 statusInStream = false;
-                // Phantom status establishes the running status for subsequent commands.
-                if (status < 0xF8)
+                // Phantom status is always a channel message; establish running status.
+                if (status < 0xF0)
                     runningStatus = status;
             }
             else
@@ -423,8 +425,13 @@ public sealed class RtpMidiPacket
                     // New status byte present in the stream.
                     status         = b;
                     statusInStream = true;
-                    if (b < 0xF8)
-                        runningStatus = b; // channel + system-common update running status
+                    // Channel messages (0x80–0xEF) establish running status;
+                    // system common (0xF0–0xF7) cancel it;
+                    // real-time (0xF8–0xFF) leave it unchanged.
+                    if (b < 0xF0)
+                        runningStatus = b;
+                    else if (b < 0xF8)
+                        runningStatus = null;
                 }
                 else if (runningStatus.HasValue)
                 {

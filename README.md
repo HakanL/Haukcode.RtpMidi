@@ -141,7 +141,7 @@ RTP-MIDI uses two UDP ports per session:
 
 The clock sync exchange (CK0 → CK1 → CK2) is **mandatory** — hardware bridges will not confirm the connection until it completes. This library implements the full 3-way exchange and repeats it every ~10 seconds to maintain the session.
 
-### Recovery Journal (RFC 6295 §4 / §A)
+### Recovery Journal (RFC 6295 §5 / §A)
 
 The library implements the full RFC 6295 recovery journal on both the send and receive sides.
 

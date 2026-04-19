@@ -85,6 +85,10 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // --- Inbound sequence tracking for gap detection ---
     private ushort? expectedSeqNum;
 
+    // --- RS (Receiver Feedback) rate limiting ---
+    private int rsPacketCount;
+    private const int RsEveryNPackets = 10;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -160,6 +164,9 @@ public sealed class RtpMidiSession : IRtpMidiSession
         sequenceNumber   = (ushort)Random.Shared.Next(0, ushort.MaxValue);
         lastSysExPayload = null;
         expectedSeqNum   = null;
+        for (int i = 0; i < 16; i++) channelStates[i].Reset();
+        systemMidiState.Reset();
+        rsPacketCount = 0;
 
         // Bind local sockets on ephemeral ports (OS assigns)
         controlSocket = new UdpClient(0);
@@ -177,18 +184,28 @@ public sealed class RtpMidiSession : IRtpMidiSession
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(HandshakeTimeoutMs);
 
-        // Step 1: Handshake control port
-        await HandshakePortAsync(controlSocket, remoteControlEp, timeoutCts.Token);
-        State = SessionState.ConnectingData;
+        const int MaxSsrcRetries = 3;
+        for (int ssrcAttempt = 0; ssrcAttempt < MaxSsrcRetries; ssrcAttempt++)
+        {
+            // Step 1: Handshake control port
+            await HandshakePortAsync(controlSocket, remoteControlEp, timeoutCts.Token);
+            State = SessionState.ConnectingData;
 
-        // Step 2: Handshake data port
-        await HandshakePortAsync(dataSocket, remoteDataEp, timeoutCts.Token);
+            // Step 2: Handshake data port
+            await HandshakePortAsync(dataSocket, remoteDataEp, timeoutCts.Token);
 
-        // SSRC collision detection (RFC 3550 §8.2): if local and remote chose the same SSRC,
-        // regenerate the local one and restart the handshake.
-        if (DetectAndResolveSsrcCollision())
-            throw new InvalidOperationException(
-                $"SSRC collision with remote peer (SSRC={remoteSsrc:X8}). A new local SSRC has been assigned; please retry the connection.");
+            // SSRC collision detection (RFC 3550 §8.2): if local and remote chose the same SSRC,
+            // regenerate the local one and transparently retry the handshake.
+            if (!DetectAndResolveSsrcCollision())
+                break;
+
+            if (ssrcAttempt == MaxSsrcRetries - 1)
+                throw new InvalidOperationException(
+                    $"SSRC collision persisted after {MaxSsrcRetries} retries (remoteSsrc={remoteSsrc:X8}).");
+
+            State = SessionState.ConnectingControl;
+            initiatorToken = AppleSessionProtocol.GenerateInitiatorToken();
+        }
 
         State = SessionState.Connected;
 
@@ -224,6 +241,9 @@ public sealed class RtpMidiSession : IRtpMidiSession
         sequenceNumber   = (ushort)Random.Shared.Next(0, ushort.MaxValue);
         lastSysExPayload = null;
         expectedSeqNum   = null;
+        for (int i = 0; i < 16; i++) channelStates[i].Reset();
+        systemMidiState.Reset();
+        rsPacketCount = 0;
 
         if (TraceHook != null)
             TraceHook($"[{localName}] ListenAsync controlPort={controlPort} dataPort={dataPort} localSsrc={localSsrc:X8} seqStart={sequenceNumber}");
@@ -256,10 +276,37 @@ public sealed class RtpMidiSession : IRtpMidiSession
         dataSocket.Connect(remoteDataEp);
 
         // SSRC collision detection (RFC 3550 §8.2): if local and remote chose the same SSRC,
-        // regenerate the local one and restart the handshake.
+        // regenerate the local one. The peer will re-initiate after receiving our BY.
         if (DetectAndResolveSsrcCollision())
-            throw new InvalidOperationException(
-                $"SSRC collision with remote peer (SSRC={remoteSsrc:X8}). A new local SSRC has been assigned; please retry the connection.");
+        {
+            if (TraceHook != null)
+                TraceHook($"[{localName}] SSRC collision on listen; sending BY and waiting for peer to re-initiate");
+            await SendByAsync(controlSocket, remoteControlEp);
+            await SendByAsync(dataSocket,    remoteDataEp);
+
+            // Wait for the peer to re-initiate with a fresh handshake.
+            State = SessionState.ConnectingControl;
+            remoteControlEp = await AcceptPortAsync(controlSocket, ct);
+
+            State = SessionState.ConnectingData;
+            using var retryDataCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            retryDataCts.CancelAfter(HandshakeTimeoutMs);
+            try
+            {
+                remoteDataEp = await AcceptPortAsync(dataSocket, retryDataCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"RTP-MIDI data port handshake timed out on SSRC-collision retry (port {dataPort}).");
+            }
+            controlSocket.Connect(remoteControlEp);
+            dataSocket.Connect(remoteDataEp);
+
+            if (DetectAndResolveSsrcCollision())
+                throw new InvalidOperationException(
+                    $"SSRC collision persisted after retry (remoteSsrc={remoteSsrc:X8}).");
+        }
 
         State = SessionState.Connected;
 
@@ -614,10 +661,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
                     expectedSeqNum = (ushort)(midiPkt.SequenceNumber + 1);
 
-                    // Send RS (Receiver Feedback) on the control socket so the remote
-                    // peer can advance its recovery journal checkpoint.
-                    if (controlSocket != null)
+                    // Send RS (Receiver Feedback) every RsEveryNPackets packets so the remote
+                    // peer can advance its recovery journal checkpoint without flooding
+                    // the control socket on high-throughput streams.
+                    rsPacketCount++;
+                    if (controlSocket != null && rsPacketCount >= RsEveryNPackets)
                     {
+                        rsPacketCount = 0;
                         var rs = new ReceiverFeedbackPacket(localSsrc, midiPkt.SequenceNumber);
                         var encoded = AppleSessionProtocol.EncodeReceiverFeedback(rs);
                         if (TraceHook != null)
@@ -817,8 +867,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
             var by = new SessionPacket(
                 AppleSessionCommand.EndSession,
                 AppleSessionProtocol.ProtocolVersion,
-                0,
-                0,
+                initiatorToken,
+                localSsrc,
                 null);
             if (TraceHook != null)
                 TraceHook($"[{localName}] TX session EndSession (BY) to {remote}");

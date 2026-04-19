@@ -104,6 +104,37 @@ internal sealed class ChannelMidiState
         HasProgram || HasControlChange || HasPitchWheel ||
         HasNoteOff || HasNoteOn || HasChannelPressure || HasPolyPressure;
 
+    /// <summary>
+    /// Clears all accumulated channel state.  Call at the start of each new session so that
+    /// recovery journals do not carry over state from a previous peer.
+    /// </summary>
+    public void Reset()
+    {
+        HasProgram       = false;
+        Program          = 0;
+        HasBankCoarse    = false;
+        BankCoarse       = 0;
+        HasBankFine      = false;
+        BankFine         = 0;
+        HasControlChange = false;
+        Array.Clear(ccValues,  0, ccValues.Length);
+        Array.Clear(ccActive,  0, ccActive.Length);
+        HasPitchWheel    = false;
+        PitchLsb         = 0;
+        PitchMsb         = 0;
+        HasNoteOff       = false;
+        Array.Clear(noteOffVel,    0, noteOffVel.Length);
+        Array.Clear(noteOffActive, 0, noteOffActive.Length);
+        HasNoteOn        = false;
+        Array.Clear(noteOnVel,    0, noteOnVel.Length);
+        Array.Clear(noteOnActive, 0, noteOnActive.Length);
+        HasChannelPressure = false;
+        ChannelPressure  = 0;
+        HasPolyPressure  = false;
+        Array.Clear(polyPressure,       0, polyPressure.Length);
+        Array.Clear(polyPressureActive, 0, polyPressureActive.Length);
+    }
+
     // -----------------------------------------------------------------------
     // State update
     // -----------------------------------------------------------------------
@@ -477,10 +508,15 @@ internal sealed class ChannelMidiState
 
         byte header = data[0];
         bool extendedBitfield = (header & 0x40) != 0; // B flag
-        // Extended bitfield mode (B=1) is not yet implemented; return -1 so the
-        // caller skips remaining chapters for this channel rather than misinterpreting
-        // the bitfield bytes as chapter data.
-        if (extendedBitfield) return -1;
+        if (extendedBitfield)
+        {
+            // RFC 6295 §A.5: extended bitfield mode uses a fixed 16-byte bitfield.
+            // We do not interpret it, but we must skip it so subsequent chapters can be parsed.
+            const int ExtendedBitfieldSize = 16;
+            int extSize = 1 + ExtendedBitfieldSize;
+            if (data.Length < extSize) return -1;
+            return extSize;
+        }
 
         int count = header & 0x3F;
         int required = 1 + count * 2;
@@ -606,6 +642,21 @@ internal sealed class SystemMidiState
 
     /// <summary>Returns true if any Chapter F data has been accumulated.</summary>
     public bool HasAnyData => HasTimeCode || HasSongPosition || HasSongSelect;
+
+    /// <summary>
+    /// Clears all accumulated system state.  Call at the start of each new session so that
+    /// recovery journals do not carry over state from a previous peer.
+    /// </summary>
+    public void Reset()
+    {
+        HasTimeCode     = false;
+        TimeCode        = 0;
+        HasSongPosition = false;
+        SongPositionLsb = 0;
+        SongPositionMsb = 0;
+        HasSongSelect   = false;
+        SongSelect      = 0;
+    }
 
     // -----------------------------------------------------------------------
     // State update

@@ -61,6 +61,24 @@ public class AppleSessionProtocolTests
         Assert.Equal(AppleSessionCommand.EndSession, parsed!.Command);
     }
 
+    [Fact]
+    public void EndSession_CarriesSsrcAndToken()
+    {
+        // Apple MIDI spec: BY packet must carry the sender's SSRC and initiator token.
+        var original = new SessionPacket(
+            AppleSessionCommand.EndSession,
+            AppleSessionProtocol.ProtocolVersion,
+            InitiatorToken: 0xDEADBEEF,
+            Ssrc: 0x12345678,
+            Name: null);
+
+        var encoded = AppleSessionProtocol.Encode(original);
+        Assert.True(AppleSessionProtocol.TryParse(encoded, out var parsed, out _, out _));
+        Assert.Equal(AppleSessionCommand.EndSession, parsed!.Command);
+        Assert.Equal(0xDEADBEEFu, parsed.InitiatorToken);
+        Assert.Equal(0x12345678u, parsed.Ssrc);
+    }
+
     // -------------------------------------------------------------------------
     // Clock sync
     // -------------------------------------------------------------------------

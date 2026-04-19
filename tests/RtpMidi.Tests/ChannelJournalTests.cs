@@ -683,6 +683,85 @@ public class ChannelJournalTests
     }
 
     // =========================================================================
+    // Chapter N — extended bitfield (B=1) skip
+    // =========================================================================
+
+    [Fact]
+    public void ChapterN_ExtendedBitfield_SkipsCorrectly()
+    {
+        // RFC 6295 §A.5: B=1 signals the extended bitfield mode.
+        // The decoder must skip 1 header byte + 16 bitfield bytes = 17 bytes total.
+        // Build a synthetic Chapter N with B=1 followed by a valid Chapter Q payload.
+
+        var chapterN = new byte[1 + 16]; // header + 16-byte bitfield
+        chapterN[0] = 0x40; // B=1, count=0 (extended bitfield mode, no list entries)
+        // Bitfield bytes (all zeros — no notes)
+        // chapterN[1..16] = 0
+
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterN(chapterN, 0, recovered);
+
+        // Should skip 17 bytes without error, yield no notes
+        Assert.Equal(17, consumed);
+        Assert.Empty(recovered);
+    }
+
+    [Fact]
+    public void ChapterN_ExtendedBitfield_TooShort_ReturnsError()
+    {
+        // Header says B=1 but buffer is too short to hold the 16-byte bitfield
+        var data = new byte[] { 0x40, 0x00, 0x00 }; // only 3 bytes instead of 17
+        var recovered = new List<byte[]>();
+        int result = ChannelMidiState.DecodeChapterN(data, 0, recovered);
+        Assert.Equal(-1, result);
+    }
+
+    // =========================================================================
+    // ChannelMidiState.Reset — session state cleared between connections
+    // =========================================================================
+
+    [Fact]
+    public void ChannelMidiState_Reset_ClearsAllAccumulatedState()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0x90, 60, 100]); // Note On
+        state.ProcessMidi([0xC0, 5]);        // Program Change
+        state.ProcessMidi([0xB0, 7, 127]);   // CC volume
+        state.ProcessMidi([0xE0, 0x10, 0x40]); // Pitch Wheel
+
+        Assert.True(state.HasAnyData);
+
+        state.Reset();
+
+        Assert.False(state.HasAnyData);
+        Assert.False(state.HasNoteOn);
+        Assert.False(state.HasNoteOff);
+        Assert.False(state.HasProgram);
+        Assert.False(state.HasControlChange);
+        Assert.False(state.HasPitchWheel);
+        Assert.False(state.HasChannelPressure);
+        Assert.False(state.HasPolyPressure);
+    }
+
+    [Fact]
+    public void SystemMidiState_Reset_ClearsAllAccumulatedState()
+    {
+        var state = new SystemMidiState();
+        state.ProcessMidi([0xF1, 0x40]); // MTC Quarter Frame
+        state.ProcessMidi([0xF2, 0x10, 0x00]); // Song Position
+        state.ProcessMidi([0xF3, 3]); // Song Select
+
+        Assert.True(state.HasAnyData);
+
+        state.Reset();
+
+        Assert.False(state.HasAnyData);
+        Assert.False(state.HasTimeCode);
+        Assert.False(state.HasSongPosition);
+        Assert.False(state.HasSongSelect);
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 

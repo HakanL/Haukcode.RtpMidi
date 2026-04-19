@@ -132,4 +132,65 @@ public class RtpMidiPacketTests
         var ts2   = RtpMidiPacket.CurrentTimestamp(start);
         Assert.True(ts2 > ts1, "Timestamp should increase over time");
     }
+
+    // -------------------------------------------------------------------------
+    // RFC 6295 §4.1 — CC > 0 and X=1 header extension handling
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Parse_SkipsCSRCList_WhenCCNonZero()
+    {
+        // Build a valid packet and inject 2 CSRC entries (CC=2, 8 extra bytes)
+        var encoded = RtpMidiPacket.Encode(0xAABBCCDDu, 99, 500, SimpleMidi);
+
+        // Expand buffer to add 2 CSRC entries after the 12-byte fixed header
+        var withCsrc = new byte[encoded.Length + 2 * 4];
+        encoded[0] = (byte)((encoded[0] & 0xF0) | 2); // CC=2
+
+        // Copy fixed header (12 bytes)
+        encoded.AsSpan(0, 12).CopyTo(withCsrc);
+        // Insert two dummy CSRC words at offset 12
+        withCsrc[12] = 0x11; withCsrc[13] = 0x22; withCsrc[14] = 0x33; withCsrc[15] = 0x44;
+        withCsrc[16] = 0x55; withCsrc[17] = 0x66; withCsrc[18] = 0x77; withCsrc[19] = 0x88;
+        // Copy MIDI command section after the CSRC list
+        encoded.AsSpan(12).CopyTo(withCsrc.AsSpan(20));
+
+        Assert.True(RtpMidiPacket.TryParse(withCsrc, out var pkt));
+        Assert.NotNull(pkt);
+        Assert.Equal(SimpleMidi, pkt!.MidiBytes.ToArray());
+        Assert.Equal(99, pkt.SequenceNumber);
+    }
+
+    [Fact]
+    public void Parse_SkipsHeaderExtension_WhenXBitSet()
+    {
+        // Build a valid packet, then inject a 4-byte extension header (X=1, extLen=0 words)
+        var encoded = RtpMidiPacket.Encode(0x11223344u, 7, 100, SimpleMidi);
+
+        var withExt = new byte[encoded.Length + 4];
+        encoded[0] = (byte)(encoded[0] | 0x10); // X=1, CC=0
+
+        // Copy fixed RTP header (12 bytes)
+        encoded.AsSpan(0, 12).CopyTo(withExt);
+        // Insert minimal extension header: profile=0x0000, length=0 (0 extra 32-bit words)
+        withExt[12] = 0x00; withExt[13] = 0x00; // extension profile
+        withExt[14] = 0x00; withExt[15] = 0x00; // extension length in 32-bit words = 0
+        // Copy MIDI command section
+        encoded.AsSpan(12).CopyTo(withExt.AsSpan(16));
+
+        Assert.True(RtpMidiPacket.TryParse(withExt, out var pkt));
+        Assert.NotNull(pkt);
+        Assert.Equal(SimpleMidi, pkt!.MidiBytes.ToArray());
+    }
+
+    [Fact]
+    public void Parse_RejectsPacket_WhenCCMakesBufferTooShort()
+    {
+        // CC=3 requires 12 extra bytes, but we only have the base 12-byte header
+        var encoded = RtpMidiPacket.Encode(1u, 1, 0, SimpleMidi);
+        encoded[0] = (byte)((encoded[0] & 0xF0) | 3); // CC=3 but no room for CSRCs
+        // Truncate to just the fixed header (no CSRC room)
+        var truncated = encoded[..12];
+        Assert.False(RtpMidiPacket.TryParse(truncated, out _));
+    }
 }

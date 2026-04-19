@@ -83,8 +83,26 @@ public sealed class RtpMidiPacket
         var ts   = BinaryPrimitives.ReadUInt32BigEndian(data[4..]);
         var ssrc = BinaryPrimitives.ReadUInt32BigEndian(data[8..]);
 
+        // RFC 6295 §4.1 — skip past CSRC list (CC entries × 4 bytes each)
+        int cc = data[0] & 0x0F;
+        bool extensionBit = (data[0] & 0x10) != 0;
+        int payloadOffset = RtpHeaderSize + cc * 4;
+
+        // RFC 6295 §4.1 — skip the RTP header extension (X=1): 4-byte extension header
+        // whose last two bytes contain the extension length (in 32-bit words).
+        if (extensionBit)
+        {
+            if (data.Length < payloadOffset + 4)
+                return false;
+            int extWords = BinaryPrimitives.ReadUInt16BigEndian(data[(payloadOffset + 2)..]);
+            payloadOffset += 4 + extWords * 4;
+        }
+
+        if (data.Length < payloadOffset + 1)
+            return false;
+
         // Parse MIDI command section header
-        var section = data[RtpHeaderSize..];
+        var section = data[payloadOffset..];
         if (section.IsEmpty)
             return false;
 

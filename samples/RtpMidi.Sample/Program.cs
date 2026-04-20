@@ -8,6 +8,7 @@ using Haukcode.RtpMidi.Mdns;
 //
 // Usage:
 //   dotnet run                         Discover peers via mDNS, pick one interactively
+//   dotnet run -- --scan [seconds]     Scan peers, print list, then exit
 //   dotnet run -- <host> <port>        Connect directly (e.g.  192.168.1.50 5004)
 //   dotnet run -- --listen <port>      Listen for an incoming connection
 //
@@ -19,7 +20,16 @@ using Haukcode.RtpMidi.Mdns;
 
 const string LocalName = "RtpMidi-Sample";
 
-if (args.Length >= 1 && args[0] == "--listen")
+if (args.Length >= 1 && args[0] == "--scan")
+{
+    var scanTime = TimeSpan.FromSeconds(3);
+
+    if (args.Length >= 2 && double.TryParse(args[1], out var scanSeconds) && scanSeconds > 0)
+        scanTime = TimeSpan.FromSeconds(scanSeconds);
+
+    await RunScanOnlyAsync(scanTime);
+}
+else if (args.Length >= 1 && args[0] == "--listen")
 {
     int listenPort = args.Length >= 2 ? int.Parse(args[1]) : 5004;
     await RunListenerAsync(listenPort);
@@ -36,30 +46,82 @@ else
 }
 
 // ---------------------------------------------------------------------------
-// Discovery → interactive peer selection → connect
+// Discovery → scan only → print peers → exit
 // ---------------------------------------------------------------------------
 
-static async Task RunDiscoveryAndConnectAsync()
+static async Task RunScanOnlyAsync(TimeSpan scanTime)
 {
-    Console.WriteLine("Scanning for RTP-MIDI peers (2 s)…");
+    Console.WriteLine($"Scanning for RTP-MIDI peers ({scanTime.TotalSeconds:0.#} s)…");
 
-    var peers = await RtpMidiDiscovery.ResolveAsync();
+    var peers = await RtpMidiDiscovery.ResolveAsync(scanTime);
 
     if (peers.Count == 0)
     {
-        Console.WriteLine("No peers found. Try: dotnet run -- <host> <port>");
+        Console.WriteLine("No peers found.");
         return;
     }
 
     Console.WriteLine($"\nFound {peers.Count} peer(s):\n");
     for (int i = 0; i < peers.Count; i++)
         Console.WriteLine($"  [{i + 1}] {peers[i].Name}  ({peers[i].ControlEndPoint})");
+}
 
-    Console.Write("\nSelect peer number (or 0 to exit): ");
-    if (!int.TryParse(Console.ReadLine(), out int choice) || choice < 1 || choice > peers.Count)
+// ---------------------------------------------------------------------------
+// Discovery → interactive peer selection → connect
+// ---------------------------------------------------------------------------
+
+static async Task RunDiscoveryAndConnectAsync()
+{
+    var scanTime = TimeSpan.FromSeconds(3);
+
+    while (true)
+    {
+        Console.WriteLine($"Scanning for RTP-MIDI peers ({scanTime.TotalSeconds:0} s)…");
+
+        var peers = await RtpMidiDiscovery.ResolveAsync(scanTime);
+
+        if (peers.Count == 0)
+        {
+            Console.WriteLine("No peers found yet. Press Enter to rescan, or type 0 to exit.");
+            var noPeerInput = Console.ReadLine();
+            if (string.Equals(noPeerInput?.Trim(), "0", StringComparison.Ordinal))
+                return;
+
+            Console.WriteLine();
+            continue;
+        }
+
+        Console.WriteLine($"\nFound {peers.Count} peer(s):\n");
+        for (int i = 0; i < peers.Count; i++)
+            Console.WriteLine($"  [{i + 1}] {peers[i].Name}  ({peers[i].ControlEndPoint})");
+
+        Console.Write("\nSelect peer number (Enter to refresh, or 0 to exit): ");
+        var input = Console.ReadLine();
+
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            Console.WriteLine();
+            continue;
+        }
+
+        if (!int.TryParse(input, out int choice))
+        {
+            Console.WriteLine("Please enter a valid number.");
+            continue;
+        }
+
+        if (choice == 0)
+            return;
+
+        if (choice < 1 || choice > peers.Count)
+        {
+            Console.WriteLine("Selection out of range.");
+            continue;
+        }
+
+        await RunClientAsync(peers[choice - 1].ControlEndPoint);
         return;
-
-    await RunClientAsync(peers[choice - 1].ControlEndPoint);
+    }
 }
 
 // ---------------------------------------------------------------------------

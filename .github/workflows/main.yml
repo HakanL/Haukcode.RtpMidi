@@ -52,9 +52,61 @@ jobs:
       env:
         DOTNET_CLI_TELEMETRY_OPTOUT: 1
 
+  interop-self:
+    name: Interop (self) on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: test
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Build InteropTest
+      run: dotnet build ../tests/RtpMidi.InteropTest --configuration Release
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Start InteropTest server (background)
+      shell: bash
+      run: |
+        dotnet run --project ../tests/RtpMidi.InteropTest --configuration Release --no-build -- \
+          server --port 5004 &
+        echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+        sleep 3
+
+    - name: Run InteropTest client (loopback, all 14 checks)
+      shell: bash
+      run: |
+        dotnet run --project ../tests/RtpMidi.InteropTest --configuration Release --no-build -- \
+          client --host 127.0.0.1 --port 5004 --loopback
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Stop server
+      if: always()
+      shell: bash
+      run: |
+        kill "$SERVER_PID" 2>/dev/null || true
+        # On Windows, kill the full process tree so orphaned dotnet children don't
+        # hold file locks when actions/checkout runs its post-step git cleanup.
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          sleep 1
+          taskkill //F //T //PID "$SERVER_PID" 2>/dev/null || true
+        fi
+
   publish:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, interop-self]
     permissions:
       contents: write
 

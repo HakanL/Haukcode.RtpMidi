@@ -66,6 +66,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // --- Sequence counter for outbound RTP packets ---
     private ushort sequenceNumber;
 
+    /// <summary>
+    /// Advances the outgoing sequence number by <paramref name="count"/> without sending any
+    /// packet, simulating packet loss on the wire.  Used exclusively by the interop test to
+    /// verify that the receiver can reconstruct dropped events from the recovery journal.
+    /// </summary>
+    internal void SimulatePacketLoss(int count = 1) => sequenceNumber += (ushort)count;
+
     // --- SysEx reassembly state (receive side) ---
     private List<byte>? sysExBuffer;
 

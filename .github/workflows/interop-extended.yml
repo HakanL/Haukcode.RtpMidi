@@ -1,0 +1,209 @@
+name: Interop Extended
+
+# Triggered manually (with optional external peer inputs) or on a nightly schedule.
+# All jobs are independent so failures in one do not block the others.
+
+on:
+  workflow_dispatch:
+    inputs:
+      peer_host:
+        description: >
+          IP or hostname of an external RTP-MIDI peer (e.g. macOS machine, rtpMIDI on Windows).
+          Leave empty to run self-interop only.
+        required: false
+        default: ''
+      peer_port:
+        description: 'Control port of the external peer (default: 5004)'
+        required: false
+        default: '5004'
+      peer_label:
+        description: 'Human-readable label for the peer shown in job names and results'
+        required: false
+        default: 'external-peer'
+  schedule:
+    # Nightly at 02:00 UTC — self-interop + rtpmidid runs automatically
+    - cron: '0 2 * * *'
+
+defaults:
+  run:
+    working-directory: src
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Self-interop: our loopback server + client (all 14 checks)
+  # Runs on every platform to catch OS-specific networking differences.
+  # ---------------------------------------------------------------------------
+  interop-extended-self:
+    name: Extended self-interop on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Build InteropTest
+      run: dotnet build ../tests/RtpMidi.InteropTest --configuration Release
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Start InteropTest server (background)
+      shell: bash
+      run: |
+        dotnet run --project ../tests/RtpMidi.InteropTest --configuration Release --no-build -- \
+          server --port 5004 &
+        echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+        sleep 3
+
+    - name: Run extended client (all 14 checks, loopback)
+      shell: bash
+      run: |
+        dotnet run --project ../tests/RtpMidi.InteropTest --configuration Release --no-build -- \
+          client --host 127.0.0.1 --port 5004 --loopback
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Stop server
+      if: always()
+      shell: bash
+      run: kill "$SERVER_PID" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # rtpmidid interop: our library as RTP-MIDI client, rtpmidid as the peer.
+  # Checks handshake + clock-sync, then uses DryWetMidi to verify MIDI
+  # arrived on rtpmidid's ALSA port.
+  # Linux only because rtpmidid is a Linux daemon.
+  # continue-on-error: ALSA kernel modules may not be available in all envs.
+  # ---------------------------------------------------------------------------
+  interop-extended-rtpmidid:
+    name: Extended interop (rtpmidid, Ubuntu)
+    # rtpmidid is not packaged in standard Ubuntu repos; build from source.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Build rtpmidid from source
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y cmake build-essential libasound2-dev libssl-dev libfmt-dev libavahi-client-dev alsa-utils
+        git clone --depth 1 https://github.com/davidmoreno/rtpmidid.git /tmp/rtpmidid
+        cmake -S /tmp/rtpmidid -B /tmp/rtpmidid/build -DCMAKE_BUILD_TYPE=Release
+        cmake --build /tmp/rtpmidid/build -- -j$(nproc)
+        sudo cp /tmp/rtpmidid/build/src/rtpmidid /usr/local/bin/rtpmidid
+      env:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Load virtual ALSA sound card + sequencer modules
+      run: |
+        sudo apt-get install -y --no-install-recommends linux-modules-extra-$(uname -r)
+        sudo depmod -a
+        echo "=== Available ALSA kernel modules ==="
+        find /lib/modules/$(uname -r)/kernel/sound -name "*.ko*" 2>/dev/null | sort | head -40 \
+          || echo "(no sound modules found under /lib/modules/$(uname -r)/kernel/sound)"
+        echo "=== Loading ALSA loopback card (triggers ALSA card init) ==="
+        sudo modprobe snd-aloop numid=1 && echo "snd-aloop: loaded OK" \
+          || { sudo modprobe snd-dummy && echo "snd-dummy: loaded OK"; } \
+          || echo "WARNING: neither snd-aloop nor snd-dummy could be loaded"
+        echo "=== Loading ALSA sequencer ==="
+        sudo modprobe snd-seq       && echo "snd-seq: loaded OK"       || echo "snd-seq: FAILED (may be built-in)"
+        sudo modprobe snd-seq-device && echo "snd-seq-device: loaded OK" || echo "snd-seq-device: FAILED (may be built-in)"
+        sudo modprobe snd-rawmidi   && echo "snd-rawmidi: loaded OK"   || echo "snd-rawmidi: FAILED"
+        sudo modprobe snd-seq-midi  && echo "snd-seq-midi: loaded OK"  || echo "snd-seq-midi: FAILED"
+        echo "=== /dev/snd/ contents ==="
+        ls -la /dev/snd/ 2>/dev/null || echo "/dev/snd/ directory does not exist"
+        echo "=== Loaded snd* modules ==="
+        lsmod | grep "^snd" || echo "(no snd* modules currently loaded)"
+        if [ ! -c /dev/snd/seq ]; then
+          echo "::error::/dev/snd/seq not available — ALSA sequencer could not be initialised on this kernel"
+          exit 1
+        fi
+        sudo chmod a+rw /dev/snd/seq
+      env:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Build InteropTest
+      run: dotnet build ../tests/RtpMidi.InteropTest --configuration Release
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Start rtpmidid
+      run: |
+        sudo mkdir -p /var/run/rtpmidid
+        sudo chmod a+rwx /var/run/rtpmidid
+        rtpmidid --port 5004 &
+        RTPMIDID_PID=$!
+        echo "RTPMIDID_PID=$RTPMIDID_PID" >> "$GITHUB_ENV"
+        sleep 3
+        if ! kill -0 "$RTPMIDID_PID" 2>/dev/null; then
+          echo "::error::rtpmidid failed to start or exited early"
+          exit 1
+        fi
+
+    - name: Run InteropTest client (handshake + clock-sync)
+      run: |
+        dotnet run --project ../tests/RtpMidi.InteropTest --configuration Release --no-build -- \
+          client --host 127.0.0.1 --port 5004
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Stop rtpmidid
+      if: always()
+      run: kill "${RTPMIDID_PID:-}" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # External peer: connect to a real implementation on another machine.
+  # Only runs when peer_host is supplied via workflow_dispatch.
+  # Useful for one-click tests against physical hardware, macOS CoreMIDI, or
+  # rtpMIDI on Windows running on a self-hosted runner or reachable over LAN.
+  # ---------------------------------------------------------------------------
+  interop-extended-external:
+    name: >
+      Extended interop against
+      ${{ github.event.inputs.peer_label || 'none' }}
+      (${{ github.event.inputs.peer_host || 'N/A' }}:${{ github.event.inputs.peer_port || '5004' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.peer_host != '' }}
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Build InteropTest
+      run: dotnet build ../tests/RtpMidi.InteropTest --configuration Release
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    - name: Run InteropTest client against external peer
+      run: |
+        dotnet run --project ../tests/RtpMidi.InteropTest --configuration Release --no-build -- \
+          client \
+          --host "${{ github.event.inputs.peer_host }}" \
+          --port "${{ github.event.inputs.peer_port }}"
+      env:
+        DOTNET_CLI_TELEMETRY_OPTOUT: 1

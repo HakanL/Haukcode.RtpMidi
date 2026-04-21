@@ -87,23 +87,23 @@ internal sealed class ChannelMidiState
     // versions of this library split these into separate chapters N and Q;
     // Q is not defined by RFC 6295 and is now removed.
 
-    /// <summary>Set for each note whose most recent N-active event is a NoteOn (strike).</summary>
-    private readonly bool[] noteOnActive = new bool[128];
+    /// <summary>
+    /// Per-note accumulation for Chapter N. Owns the note-on log and
+    /// OFFBITS bitfield, plus the "strike velocity per note" mapping.
+    /// </summary>
+    private readonly Journal.State.NoteState noteState = new();
 
-    /// <summary>Strike velocity (1–127) of the most recent NoteOn, per note.</summary>
-    private readonly byte[] noteOnVel    = new byte[128];
-
-    /// <summary>Set for each note whose most recent N-active event is a NoteOff.</summary>
-    private readonly bool[] noteOffActive = new bool[128];
+    /// <summary>Exposes the note state to the Chapter N codec.</summary>
+    internal Journal.State.NoteState NoteState => noteState;
 
     /// <summary>True when the Chapter N note list is non-empty.</summary>
-    public bool HasNoteOn  { get; private set; }
+    public bool HasNoteOn  => noteState.HasNoteOn;
 
     /// <summary>True when the Chapter N OFFBITS structure is non-empty.</summary>
-    public bool HasNoteOff { get; private set; }
+    public bool HasNoteOff => noteState.HasNoteOff;
 
     /// <summary>True when any Chapter N data (either NoteOn log entries or OFFBITS bits) is present.</summary>
-    public bool HasNotes => HasNoteOn || HasNoteOff;
+    public bool HasNotes => noteState.HasAnyData;
 
     // -----------------------------------------------------------------------
     // Chapter T — Channel Pressure (Aftertouch)
@@ -174,11 +174,7 @@ internal sealed class ChannelMidiState
         HasPitchWheel    = false;
         PitchLsb         = 0;
         PitchMsb         = 0;
-        HasNoteOn        = false;
-        HasNoteOff       = false;
-        Array.Clear(noteOnActive,  0, noteOnActive.Length);
-        Array.Clear(noteOnVel,     0, noteOnVel.Length);
-        Array.Clear(noteOffActive, 0, noteOffActive.Length);
+        noteState.Reset();
         HasChannelPressure = false;
         ChannelPressure  = 0;
         HasPolyPressure  = false;
@@ -207,33 +203,12 @@ internal sealed class ChannelMidiState
         {
             case 0x80: // Note Off
                 if (midiData.Length >= 3)
-                {
-                    byte note = (byte)(midiData[1] & 0x7F);
-                    // Most-recent-wins: move note from log list to OFFBITS.
-                    noteOnActive[note]  = false;
-                    noteOffActive[note] = true;
-                    RefreshNoteFlags();
-                }
+                    noteState.ProcessNoteOff(midiData[1]);
                 break;
 
             case 0x90: // Note On (velocity 0 = Note Off per RFC 6295 §A.6)
                 if (midiData.Length >= 3)
-                {
-                    byte note = (byte)(midiData[1] & 0x7F);
-                    byte vel  = (byte)(midiData[2] & 0x7F);
-                    if (vel == 0)
-                    {
-                        noteOnActive[note]  = false;
-                        noteOffActive[note] = true;
-                    }
-                    else
-                    {
-                        noteOnActive[note]  = true;
-                        noteOnVel[note]     = vel; // strike velocity (always 1-127)
-                        noteOffActive[note] = false;
-                    }
-                    RefreshNoteFlags();
-                }
+                    noteState.ProcessNoteOn(midiData[1], midiData[2]);
                 break;
 
             case 0xA0: // Poly Key Pressure
@@ -291,20 +266,6 @@ internal sealed class ChannelMidiState
         }
     }
 
-    /// <summary>Recompute the "any notes in log/offbits" flags after a per-note update.</summary>
-    private void RefreshNoteFlags()
-    {
-        bool anyOn = false, anyOff = false;
-        for (int i = 0; i < 128; i++)
-        {
-            if (noteOnActive[i])  anyOn  = true;
-            if (noteOffActive[i]) anyOff = true;
-            if (anyOn && anyOff) break;
-        }
-        HasNoteOn  = anyOn;
-        HasNoteOff = anyOff;
-    }
-
     // -----------------------------------------------------------------------
     // Chapter encoding
     // -----------------------------------------------------------------------
@@ -333,128 +294,9 @@ internal sealed class ChannelMidiState
     public byte[] EncodeChapterW(bool isLast)
         => new Journal.Chapters.ChapterWCodec(this).Encode(isLast);
 
-    /// <summary>
-    /// Encodes Chapter N (MIDI NoteOn and NoteOff) — RFC 6295 §A.6.
-    ///
-    ///   Header (2 octets, always):
-    ///     Byte 0:  B | LEN[6:0]         B = 1 always, per §A.6.1 guidance
-    ///                                   LEN = number of note log entries (7-bit, not count-1)
-    ///     Byte 1:  LOW[3:0] | HIGH[3:0]
-    ///       If LOW ≤ HIGH, OFFBITS occupies (HIGH − LOW + 1) octets after the log list.
-    ///       If LOW = 15 and HIGH = 0 or 1, the OFFBITS structure is empty.
-    ///
-    ///   Each note log (2 bytes): S | NOTENUM[6:0] | Y | VELOCITY[6:0]
-    ///     NOTENUM  = note number (0–127)
-    ///     VELOCITY = strike velocity of the most recent N-active NoteOn (never 0)
-    ///     Y        = sender hint: 1 = play the recovered NoteOn, 0 = skip it
-    ///
-    ///   OFFBITS: packed 8-bit octets where the MSB of the first octet represents
-    ///   note 8·LOW and successive bits advance by one note number. A set bit
-    ///   codes a NoteOff command for that note.
-    /// </summary>
-    /// <remarks>
-    /// Unlike other chapters, Chapter N uses byte-0 bit-7 as the <c>B</c> bit
-    /// (§A.6.1 — a per-chapter semantic indicating NoteOff-log presence hint),
-    /// NOT the generic per-chapter S "last in journal" bit. RFC §A.6.1 guidance
-    /// is to set B=1 and we follow that unconditionally. The
-    /// <paramref name="isLast"/> parameter is accepted for interface uniformity
-    /// with other chapter encoders (so the orchestrator can dispatch chapters
-    /// generically) but is not used by this encoder.
-    /// </remarks>
+    /// <summary>Encodes Chapter N. Delegates to <see cref="Journal.Chapters.ChapterNCodec"/>.</summary>
     public byte[] EncodeChapterN(bool isLast)
-    {
-        // ── Gather the note log list (notes whose most recent event is NoteOn) ──
-        var logEntries = new List<(byte note, byte vel)>(128);
-        for (int i = 0; i < 128; i++)
-        {
-            if (noteOnActive[i])
-                logEntries.Add(((byte)i, noteOnVel[i]));
-        }
-
-        int logCount = logEntries.Count; // 0-128
-
-        // ── Compute OFFBITS coverage (octet range of pending NoteOffs) ──
-        int lowOct = 16, highOct = -1;
-        for (int oct = 0; oct < 16; oct++)
-        {
-            bool any = false;
-            for (int b = 0; b < 8; b++)
-            {
-                if (noteOffActive[oct * 8 + b]) { any = true; break; }
-            }
-            if (any)
-            {
-                if (oct < lowOct)  lowOct  = oct;
-                if (oct > highOct) highOct = oct;
-            }
-        }
-
-        bool hasOffbits = highOct >= lowOct;
-        int  offbitsBytes = hasOffbits ? (highOct - lowOct + 1) : 0;
-
-        // Header-byte-1 encodes the OFFBITS range. RFC §A.6.1 specifies the
-        // "empty OFFBITS" sentinels: LOW=15 with HIGH=0 or HIGH=1.
-        byte low, high;
-        if (hasOffbits) { low = (byte)lowOct; high = (byte)highOct; }
-        else            { low = 15;           high = 0; }
-
-        // LEN=127 is the special value that codes count=127 OR count=128 depending
-        // on LOW/HIGH: if LEN=127, LOW=15, HIGH=0, the note list is 128 entries
-        // long AND there is no OFFBITS structure. For any count ≤ 127 we can
-        // encode it directly. For count=128 we MUST use the sentinel combination.
-        byte lenField;
-        if (logCount == 128)
-        {
-            // Force the special sentinel; cannot coexist with any OFFBITS.
-            lenField = 127;
-            low  = 15;
-            high = 0;
-            hasOffbits = false;
-            offbitsBytes = 0;
-        }
-        else
-        {
-            lenField = (byte)logCount;
-        }
-
-        // Build the chapter.
-        int total = 2 + logCount * 2 + offbitsBytes;
-        var buf = new byte[total];
-
-        // Header (2 octets). B (byte 0 bit 7) is always 1 per §A.6.1; see the
-        // <remarks> section on this method for why isLast is accepted but
-        // intentionally unused.
-        buf[0] = (byte)(0x80 | (lenField & 0x7F));
-        buf[1] = (byte)(((low & 0x0F) << 4) | (high & 0x0F));
-
-        int pos = 2;
-        for (int i = 0; i < logCount; i++)
-        {
-            bool lastEntry = i == logCount - 1;
-            buf[pos++] = (byte)((lastEntry ? 0x80 : 0) | (logEntries[i].note & 0x7F));
-            // Y = 0 (no playback hint); VELOCITY in low 7 bits, never 0.
-            byte vel = logEntries[i].vel;
-            if (vel == 0) vel = 1; // defensive — RFC forbids zero-velocity log entries
-            buf[pos++] = (byte)(vel & 0x7F);
-        }
-
-        if (hasOffbits)
-        {
-            for (int oct = lowOct; oct <= highOct; oct++)
-            {
-                byte b = 0;
-                for (int bit = 0; bit < 8; bit++)
-                {
-                    // MSB of each octet represents the lowest note in its group.
-                    if (noteOffActive[oct * 8 + bit])
-                        b |= (byte)(0x80 >> bit);
-                }
-                buf[pos++] = b;
-            }
-        }
-
-        return buf;
-    }
+        => new Journal.Chapters.ChapterNCodec(noteState).Encode(isLast);
 
     /// <summary>Encodes Chapter T. Delegates to <see cref="Journal.Chapters.ChapterTCodec"/>.</summary>
     public byte[] EncodeChapterT(bool isLast)
@@ -491,74 +333,9 @@ internal sealed class ChannelMidiState
     public static int DecodeChapterW(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
         => Journal.Chapters.ChapterWCodec.DecodeStatic(data, channel, recovered);
 
-    /// <summary>
-    /// Decodes Chapter N (RFC 6295 §A.6): 2-byte header with 7-bit LEN (= note
-    /// log count directly, NOT count-1) plus LOW/HIGH nibbles, followed by
-    /// LEN × 2-byte note-log entries (NoteOn with strike velocity) and
-    /// (HIGH−LOW+1) OFFBITS octets when LOW ≤ HIGH. Appends recovered Note On
-    /// and Note Off messages to <paramref name="recovered"/>.
-    /// </summary>
+    /// <summary>Decodes Chapter N. Delegates to <see cref="Journal.Chapters.ChapterNCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterN(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.Length < 2) return -1;
-
-        byte header0 = data[0];
-        byte header1 = data[1];
-        // B bit (0x80 of byte 0) is informational; ignore for recovery.
-        int logCount = header0 & 0x7F;
-        int low      = (header1 >> 4) & 0x0F;
-        int high     =  header1        & 0x0F;
-
-        // Special case: LEN=127 && LOW=15 && HIGH=0 codes logCount=128 and empty OFFBITS.
-        bool logCount128Special = (logCount == 127) && (low == 15) && (high == 0);
-        int  effectiveLogCount = logCount128Special ? 128 : logCount;
-
-        // Determine OFFBITS octet count. Sentinels (LOW=15,HIGH=0) and (LOW=15,HIGH=1)
-        // code "no OFFBITS". Any other LOW > HIGH is illegal per §A.6.1 but we
-        // treat it defensively as no OFFBITS to remain compatible with strays.
-        int offbitsBytes;
-        if (logCount128Special)         offbitsBytes = 0;
-        else if (low == 15 && high <= 1) offbitsBytes = 0;
-        else if (low <= high)            offbitsBytes = (high - low + 1);
-        else                             offbitsBytes = 0;
-
-        int required = 2 + effectiveLogCount * 2 + offbitsBytes;
-        if (data.Length < required) return -1;
-
-        // ── Note log list → NoteOn (0x9n) recovery ──
-        byte status90 = (byte)(0x90 | (channel & 0x0F));
-        int pos = 2;
-        for (int i = 0; i < effectiveLogCount; i++)
-        {
-            byte b0 = data[pos++];
-            byte b1 = data[pos++];
-            byte note = (byte)(b0 & 0x7F);
-            byte vel  = (byte)(b1 & 0x7F); // Y bit at position 7 ignored for emit
-            // Per §A.6.2 VELOCITY is never 0 in the note log list.
-            if (vel == 0) vel = 1;
-            recovered.Add([status90, note, vel]);
-        }
-
-        // ── OFFBITS bitfield → NoteOff (0x8n) recovery ──
-        byte status80 = (byte)(0x80 | (channel & 0x0F));
-        for (int oct = 0; oct < offbitsBytes; oct++)
-        {
-            byte b = data[pos++];
-            if (b == 0) continue;
-            int baseNote = 8 * (low + oct);
-            for (int bit = 0; bit < 8; bit++)
-            {
-                if ((b & (0x80 >> bit)) != 0)
-                {
-                    int note = baseNote + bit;
-                    if (note < 128)
-                        recovered.Add([status80, (byte)note, (byte)0]);
-                }
-            }
-        }
-
-        return required;
-    }
+        => Journal.Chapters.ChapterNCodec.DecodeStatic(data, channel, recovered);
 
     /// <summary>Decodes Chapter T. Delegates to <see cref="Journal.Chapters.ChapterTCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterT(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)

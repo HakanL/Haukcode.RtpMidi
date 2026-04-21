@@ -134,30 +134,18 @@ internal sealed class ChannelMidiState
     // -----------------------------------------------------------------------
     // Chapter M — Parameter System (RPN/NRPN)
     // -----------------------------------------------------------------------
-    //
-    // RFC 6295 §A.4 requires a full log list of parameter entries, most-recently-
-    // selected first. Each entry carries the parameter number and the most-recent
-    // data-entry values (CC6/CC38). A second selection of the same parameter number
-    // moves the entry to the front with cleared data (re-selection semantics).
 
-    private struct ParamEntry
-    {
-        public bool IsNrpn;
-        public byte ParamMsb, ParamLsb;
-        public bool HasDataMsb, HasDataLsb;
-        public byte DataMsb, DataLsb;
-    }
+    /// <summary>
+    /// RPN/NRPN parameter-system log (RFC 6295 §A.4). Owns its own accumulation
+    /// logic; this class forwards relevant Control Change events to it.
+    /// </summary>
+    private readonly Journal.State.ParameterLog paramLog = new();
 
-    /// <summary>Log of selected parameters, most-recently-selected first (RFC 6295 §A.4).</summary>
-    private readonly List<ParamEntry> paramLog = new();
-
-    /// <summary>True when a parameter-number MSB CC was received but the LSB has not yet arrived.</summary>
-    private bool hasPendingParamMsb;
-    private bool pendingIsNrpn;
-    private byte pendingParamMsb;
+    /// <summary>Exposes the parameter log to the Chapter M codec.</summary>
+    internal Journal.State.ParameterLog ParamLog => paramLog;
 
     /// <summary>True when RPN/NRPN parameter-system state has been accumulated on this channel.</summary>
-    public bool HasParameterSystem => paramLog.Count > 0 || hasPendingParamMsb;
+    public bool HasParameterSystem => paramLog.HasAnyData;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -196,10 +184,7 @@ internal sealed class ChannelMidiState
         HasPolyPressure  = false;
         Array.Clear(polyPressure,       0, polyPressure.Length);
         Array.Clear(polyPressureActive, 0, polyPressureActive.Length);
-        paramLog.Clear();
-        hasPendingParamMsb = false;
-        pendingIsNrpn      = false;
-        pendingParamMsb    = 0;
+        paramLog.Reset();
     }
 
     // -----------------------------------------------------------------------
@@ -273,52 +258,9 @@ internal sealed class ChannelMidiState
                     // Mirror bank select into Chapter P fields
                     if (cc == 0)  { BankCoarse = val; HasBankCoarse = true; }
                     if (cc == 32) { BankFine   = val; HasBankFine   = true; }
-                    // Parameter system tracking (Chapter M)
-                    switch (cc)
-                    {
-                        case 99:  // NRPN MSB — begin NRPN parameter selection
-                            hasPendingParamMsb = true;
-                            pendingIsNrpn      = true;
-                            pendingParamMsb    = val;
-                            break;
-                        case 101: // RPN MSB — begin RPN parameter selection
-                            hasPendingParamMsb = true;
-                            pendingIsNrpn      = false;
-                            pendingParamMsb    = val;
-                            break;
-                        case 98:  // NRPN LSB — complete NRPN selection
-                            if (hasPendingParamMsb && pendingIsNrpn)
-                            {
-                                FinalizeParamSelection(pendingIsNrpn, pendingParamMsb, val);
-                                hasPendingParamMsb = false;
-                            }
-                            break;
-                        case 100: // RPN LSB — complete RPN selection
-                            if (hasPendingParamMsb && !pendingIsNrpn)
-                            {
-                                FinalizeParamSelection(pendingIsNrpn, pendingParamMsb, val);
-                                hasPendingParamMsb = false;
-                            }
-                            break;
-                        case 6:   // Data Entry MSB — update front log entry
-                            if (paramLog.Count > 0)
-                            {
-                                var e = paramLog[0];
-                                e.HasDataMsb = true;
-                                e.DataMsb    = val;
-                                paramLog[0]  = e;
-                            }
-                            break;
-                        case 38:  // Data Entry LSB — update front log entry
-                            if (paramLog.Count > 0)
-                            {
-                                var e = paramLog[0];
-                                e.HasDataLsb = true;
-                                e.DataLsb    = val;
-                                paramLog[0]  = e;
-                            }
-                            break;
-                    }
+                    // Parameter system tracking (Chapter M) — ParameterLog filters
+                    // for the CCs it cares about (6, 38, 98, 99, 100, 101).
+                    paramLog.ProcessControlChange(cc, val);
                 }
                 break;
 
@@ -361,26 +303,6 @@ internal sealed class ChannelMidiState
         }
         HasNoteOn  = anyOn;
         HasNoteOff = anyOff;
-    }
-
-    /// <summary>
-    /// Completes parameter selection: removes any existing entry for the same
-    /// (isNrpn, msb, lsb) address then inserts a fresh entry at the front of
-    /// <see cref="paramLog"/> with cleared data-entry fields. Data resets on
-    /// re-selection per RFC 6295 §A.4.
-    /// </summary>
-    private void FinalizeParamSelection(bool isNrpn, byte msb, byte lsb)
-    {
-        for (int i = 0; i < paramLog.Count; i++)
-        {
-            var e = paramLog[i];
-            if (e.IsNrpn == isNrpn && e.ParamMsb == msb && e.ParamLsb == lsb)
-            {
-                paramLog.RemoveAt(i);
-                break;
-            }
-        }
-        paramLog.Insert(0, new ParamEntry { IsNrpn = isNrpn, ParamMsb = msb, ParamLsb = lsb });
     }
 
     // -----------------------------------------------------------------------
@@ -549,69 +471,9 @@ internal sealed class ChannelMidiState
     public byte[] EncodeChapterA(bool isLast)
         => new Journal.Chapters.ChapterACodec(this).Encode(isLast);
 
-    /// <summary>
-    /// Encodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.
-    ///
-    /// Wire layout:
-    ///   2-byte header: S(last) | P(pending MSB) | E(0) | U(all-RPN) | W(all-NRPN) | Z(0) |
-    ///                  10-bit total chapter length
-    ///   Optional pending byte (when P=1): Q(NRPN) | PNUM_MSB[6:0]
-    ///   Log items (most-recent-selected first), each:
-    ///     PNUM_LSB byte: S(last item) | PNUM_LSB[6:0]
-    ///     PNUM_MSB byte: Q(NRPN)     | PNUM_MSB[6:0]
-    ///     flags byte:    J(data MSB) | K(data LSB) | …
-    ///     optional: data-entry MSB (CC6) when J=1
-    ///     optional: data-entry LSB (CC38) when K=1
-    /// </summary>
+    /// <summary>Encodes Chapter M. Delegates to <see cref="Journal.Chapters.ChapterMCodec"/>.</summary>
     public byte[] EncodeChapterM(bool isLast)
-    {
-        // Compute total chapter size for the header length field
-        int pendingSize = hasPendingParamMsb ? 1 : 0;
-        int itemsSize = 0;
-        foreach (var e in paramLog)
-            itemsSize += 3 + (e.HasDataMsb ? 1 : 0) + (e.HasDataLsb ? 1 : 0);
-        int totalSize = 2 + pendingSize + itemsSize;
-
-        // U/W are hints (used with Z optimisation to omit PNUM_MSB per entry);
-        // we set them correctly for informational purposes even though Z=0 here.
-        bool allRpn  = paramLog.Count > 0 && !paramLog.Any(e => e.IsNrpn);
-        bool allNrpn = paramLog.Count > 0 && !paramLog.Any(e => !e.IsNrpn);
-
-        var buf = new byte[totalSize];
-
-        ushort hdr = (ushort)(
-            (isLast              ? 0x8000 : 0)  // S
-            | (hasPendingParamMsb ? 0x4000 : 0) // P
-            | (allRpn            ? 0x1000 : 0)  // U
-            | (allNrpn           ? 0x0800 : 0)  // W
-            | (totalSize & 0x03FF));             // Length
-        buf[0] = (byte)(hdr >> 8);
-        buf[1] = (byte)(hdr & 0xFF);
-
-        int off = 2;
-
-        if (hasPendingParamMsb)
-            buf[off++] = (byte)((pendingIsNrpn ? 0x80 : 0) | (pendingParamMsb & 0x7F));
-
-        for (int i = 0; i < paramLog.Count; i++)
-        {
-            var  e        = paramLog[i];
-            bool lastItem = i == paramLog.Count - 1;
-
-            buf[off++] = (byte)((lastItem   ? 0x80 : 0) | (e.ParamLsb & 0x7F)); // PNUM_LSB
-            buf[off++] = (byte)((e.IsNrpn   ? 0x80 : 0) | (e.ParamMsb & 0x7F)); // PNUM_MSB (Q=NRPN)
-
-            byte flags = 0;
-            if (e.HasDataMsb) flags |= 0x80; // J
-            if (e.HasDataLsb) flags |= 0x40; // K
-            buf[off++] = flags;
-
-            if (e.HasDataMsb) buf[off++] = (byte)(e.DataMsb & 0x7F);
-            if (e.HasDataLsb) buf[off++] = (byte)(e.DataLsb & 0x7F);
-        }
-
-        return buf;
-    }
+        => new Journal.Chapters.ChapterMCodec(paramLog).Encode(isLast);
 
     // -----------------------------------------------------------------------
     // Chapter decoding  (static: parse bytes → MIDI messages)
@@ -706,110 +568,9 @@ internal sealed class ChannelMidiState
     public static int DecodeChapterA(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
         => Journal.Chapters.ChapterACodec.DecodeStatic(data, channel, recovered);
 
-    /// <summary>
-    /// Decodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.
-    /// </summary>
+    /// <summary>Decodes Chapter M. Delegates to <see cref="Journal.Chapters.ChapterMCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterM(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        // Need at least the 2-byte chapter header
-        if (data.Length < 2) return -1;
-
-        ushort header  = (ushort)((data[0] << 8) | data[1]);
-        bool   pending = (header & 0x4000) != 0;
-        bool   hasZ    = (header & 0x0400) != 0;
-        bool   hasU    = (header & 0x1000) != 0; // all-RPN hint
-        bool   hasW    = (header & 0x0800) != 0; // all-NRPN hint
-        int    length  = header & 0x03FF;        // total chapter size including header
-
-        if (length < 2 || data.Length < length) return -1;
-
-        int pos = 2;
-
-        // Skip the optional pending byte
-        if (pending)
-        {
-            if (pos >= length) return length;
-            pos++;
-        }
-
-        // Z optimization: PNUM_MSB is omitted from each log item when all entries
-        // share the same PNUM_MSB (RFC 6295 §A.1). Our encoder always sets Z=0 so
-        // we never generate this format, but we parse it defensively for interoperability.
-        bool noPnumMsb = hasZ && (hasU || hasW);
-
-        byte status = (byte)(0xB0 | (channel & 0x0F));
-
-        // Walk the log list
-        while (pos < length)
-        {
-            // Log item: PNUM_LSB byte (bit 7 = S flag "last item")
-            byte pnumLsb = (byte)(data[pos] & 0x7F);
-            pos++;
-
-            // Log item: PNUM_MSB byte (bit 7 = Q flag "NRPN")
-            byte pnumMsb = 0;
-            bool itemIsNrpn = hasW; // default from chapter-level W hint
-            if (!noPnumMsb)
-            {
-                if (pos >= length) return -1;
-                itemIsNrpn = (data[pos] & 0x80) != 0;
-                pnumMsb    = (byte)(data[pos] & 0x7F);
-                pos++;
-            }
-
-            // Log item: flags byte (J=0x80, K=0x40, L=0x20, M=0x10, N=0x08, T=0x04, V=0x02, R=0x01)
-            if (pos >= length) return -1;
-            byte flags = data[pos++];
-            bool flagJ = (flags & 0x80) != 0; // data-entry MSB (CC6)
-            bool flagK = (flags & 0x40) != 0; // data-entry LSB (CC38)
-            bool flagL = (flags & 0x20) != 0; // a-button (2 bytes)
-            bool flagM = (flags & 0x10) != 0; // c-button (2 bytes)
-            bool flagN = (flags & 0x08) != 0; // count    (1 byte)
-
-            // Optional data-entry MSB
-            byte entryMsb = 0;
-            if (flagJ)
-            {
-                if (pos >= length) return -1;
-                entryMsb = (byte)(data[pos++] & 0x7F);
-            }
-
-            // Optional data-entry LSB
-            byte entryLsb = 0;
-            if (flagK)
-            {
-                if (pos >= length) return -1;
-                entryLsb = (byte)(data[pos++] & 0x7F);
-            }
-
-            // Skip a-button (L flag, 2 bytes)
-            if (flagL) { pos += 2; }
-
-            // Skip c-button (M flag, 2 bytes)
-            if (flagM) { pos += 2; }
-
-            // Skip count (N flag, 1 byte)
-            if (flagN) { pos += 1; }
-
-            // Reconstruct the CC sequence:
-            //   CC99+CC98 (NRPN) or CC101+CC100 (RPN), then CC6 and/or CC38
-            if (itemIsNrpn)
-            {
-                recovered.Add([status, 99,  pnumMsb]);  // NRPN MSB
-                recovered.Add([status, 98,  pnumLsb]);  // NRPN LSB
-            }
-            else
-            {
-                recovered.Add([status, 101, pnumMsb]);  // RPN MSB
-                recovered.Add([status, 100, pnumLsb]);  // RPN LSB
-            }
-
-            if (flagJ) recovered.Add([status, 6,  entryMsb]); // Data Entry MSB
-            if (flagK) recovered.Add([status, 38, entryLsb]); // Data Entry LSB
-        }
-
-        return length;
-    }
+        => Journal.Chapters.ChapterMCodec.DecodeStatic(data, channel, recovered);
 }
 
 /// <summary>

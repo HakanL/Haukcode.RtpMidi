@@ -52,6 +52,12 @@ internal sealed class ChannelMidiState
     private readonly byte[] ccValues  = new byte[128];
     private readonly bool[] ccActive  = new bool[128];
 
+    /// <summary>Read-only view of the per-controller last-value array (indexed 0–127).</summary>
+    internal ReadOnlySpan<byte> CcValues => ccValues;
+
+    /// <summary>Read-only view of the per-controller "has been set" flags.</summary>
+    internal ReadOnlySpan<bool> CcActive => ccActive;
+
     /// <summary>True when at least one Control Change has been sent on this channel.</summary>
     public bool HasControlChange { get; private set; }
 
@@ -115,6 +121,12 @@ internal sealed class ChannelMidiState
 
     private readonly byte[] polyPressure       = new byte[128];
     private readonly bool[] polyPressureActive = new bool[128];
+
+    /// <summary>Read-only view of the per-note last-pressure array (indexed 0–127).</summary>
+    internal ReadOnlySpan<byte> PolyPressure => polyPressure;
+
+    /// <summary>Read-only view of the per-note "has been set" flags.</summary>
+    internal ReadOnlySpan<bool> PolyPressureActive => polyPressureActive;
 
     /// <summary>True when at least one Poly Key Pressure message has been sent.</summary>
     public bool HasPolyPressure { get; private set; }
@@ -393,20 +405,7 @@ internal sealed class ChannelMidiState
     /// the chapter MUST NOT be present at all (HasControlChange governs this).
     /// </summary>
     public byte[] EncodeChapterC(bool isLast)
-    {
-        // Collect active controllers (up to 128 — 7-bit LEN field codes count-1)
-        Span<(byte cc, byte val)> entries = stackalloc (byte, byte)[128];
-        int count = 0;
-        for (int i = 0; i < 128; i++)
-        {
-            if (ccActive[i])
-                entries[count++] = ((byte)i, ccValues[i]);
-        }
-
-        // A = 0 (value tool): bit 7 of byte1 clear for all emitted entries.
-        return Journal.ChapterListEncoder.EncodeCountMinusOneList(
-            isLast, entries.Slice(0, count), secondByteFlagMask: 0x00);
-    }
+        => new Journal.Chapters.ChapterCCodec(this).Encode(isLast);
 
     /// <summary>Encodes Chapter W. Delegates to <see cref="Journal.Chapters.ChapterWCodec"/>.</summary>
     public byte[] EncodeChapterW(bool isLast)
@@ -548,19 +547,7 @@ internal sealed class ChannelMidiState
     ///     X = 0 by default (set to 1 if the command appears before All-Notes-Off/All-Sound-Off).
     /// </summary>
     public byte[] EncodeChapterA(bool isLast)
-    {
-        Span<(byte note, byte pressure)> entries = stackalloc (byte, byte)[128];
-        int count = 0;
-        for (int i = 0; i < 128; i++)
-        {
-            if (polyPressureActive[i])
-                entries[count++] = ((byte)i, polyPressure[i]);
-        }
-
-        // X = 0 (not before All-Notes-Off): bit 7 of byte1 clear for all entries.
-        return Journal.ChapterListEncoder.EncodeCountMinusOneList(
-            isLast, entries.Slice(0, count), secondByteFlagMask: 0x00);
-    }
+        => new Journal.Chapters.ChapterACodec(this).Encode(isLast);
 
     /// <summary>
     /// Encodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.
@@ -634,33 +621,9 @@ internal sealed class ChannelMidiState
     public static int DecodeChapterP(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
         => Journal.Chapters.ChapterPCodec.DecodeStatic(data, channel, recovered);
 
-    /// <summary>
-    /// Decodes Chapter C (RFC 6295 §A.3): LEN = (count − 1) in 7 bits, then
-    /// LEN+1 two-byte log entries. Appends recovered Control Changes to
-    /// <paramref name="recovered"/>. Returns bytes consumed or -1 on error.
-    /// </summary>
+    /// <summary>Decodes Chapter C. Delegates to <see cref="Journal.Chapters.ChapterCCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterC(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.IsEmpty) return -1;
-
-        byte header = data[0];
-        int count = (header & 0x7F) + 1; // LEN codes count-1; min 1 entry
-        int required = 1 + count * 2;
-        if (data.Length < required) return -1;
-
-        for (int i = 0; i < count; i++)
-        {
-            byte cc  = (byte)(data[1 + i * 2] & 0x7F);
-            byte v   = data[1 + i * 2 + 1];
-            byte val = (byte)(v & 0x7F);
-            // Ignore the A (alt-tool) bit for recovery purposes; we always emit
-            // a plain Control Change regardless of whether the sender used the
-            // value tool or the toggle/count tool.
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), cc, val]);
-        }
-
-        return required;
-    }
+        => Journal.Chapters.ChapterCCodec.DecodeStatic(data, channel, recovered);
 
     /// <summary>Decodes Chapter W. Delegates to <see cref="Journal.Chapters.ChapterWCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterW(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
@@ -739,27 +702,9 @@ internal sealed class ChannelMidiState
     public static int DecodeChapterT(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
         => Journal.Chapters.ChapterTCodec.DecodeStatic(data, channel, recovered);
 
-    /// <summary>
-    /// Decodes Chapter A (RFC 6295 §A.9): LEN = (count − 1) in 7 bits.
-    /// </summary>
+    /// <summary>Decodes Chapter A. Delegates to <see cref="Journal.Chapters.ChapterACodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterA(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.IsEmpty) return -1;
-
-        byte header = data[0];
-        int count = (header & 0x7F) + 1;
-        int required = 1 + count * 2;
-        if (data.Length < required) return -1;
-
-        for (int i = 0; i < count; i++)
-        {
-            byte note     = (byte)(data[1 + i * 2] & 0x7F);
-            byte pressure = (byte)(data[1 + i * 2 + 1] & 0x7F);
-            recovered.Add([(byte)(0xA0 | (channel & 0x0F)), note, pressure]);
-        }
-
-        return required;
-    }
+        => Journal.Chapters.ChapterACodec.DecodeStatic(data, channel, recovered);
 
     /// <summary>
     /// Decodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.

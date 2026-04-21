@@ -24,6 +24,28 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private const int    HandshakeTimeoutMs         = 5_000;
     private const int    MaxUdpPayload              = 65_507;
 
+    /// <summary>
+    /// Maximum silence from the peer before the session is considered dead
+    /// and torn down. Every inbound packet (session, clock, RTP, or feedback)
+    /// resets the timer; a dedicated watchdog task wakes periodically and,
+    /// if the gap has grown past this value while the session is Connected,
+    /// fires <see cref="DisconnectAsync"/>.
+    ///
+    /// Default: 30 s. CK clock-sync packets are exchanged every 10 s, so
+    /// 30 s is three missed heartbeats — reliably "peer is gone" without
+    /// the overly-long waits of older reference implementations that use
+    /// 60 s. Reduce (e.g. to 1-2 s) in tests; do not set below
+    /// <see cref="MinimumPeerLivenessTimeout"/>.
+    /// </summary>
+    public TimeSpan PeerLivenessTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Floor for <see cref="PeerLivenessTimeout"/>. Values below this are
+    /// silently clamped up: any shorter than ~100 ms risks false positives
+    /// from ordinary OS scheduling jitter on busy systems.
+    /// </summary>
+    public static readonly TimeSpan MinimumPeerLivenessTimeout = TimeSpan.FromMilliseconds(100);
+
     // --- Local identity ---
     private readonly string localName;
     private uint   localSsrc;
@@ -62,9 +84,17 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private Task? receiveControlTask;
     private Task? receiveDataTask;
     private Task? clockSyncTask;
+    private Task? peerLivenessTask;
 
     // --- Sequence counter for outbound RTP packets ---
     private ushort sequenceNumber;
+
+    // --- Peer liveness tracking ---
+    // UTC timestamp of the most-recent inbound packet (any kind). Updated in
+    // ReceiveLoopAsync; checked in ClockSyncLoopAsync. Stays at default(DateTime)
+    // until the session transitions to Connected so the watchdog ignores
+    // pre-handshake silence.
+    private DateTime lastPacketRxUtc;
 
     /// <summary>
     /// Advances the outgoing sequence number by <paramref name="count"/> without sending any
@@ -72,6 +102,23 @@ public sealed class RtpMidiSession : IRtpMidiSession
     /// verify that the receiver can reconstruct dropped events from the recovery journal.
     /// </summary>
     internal void SimulatePacketLoss(int count = 1) => sequenceNumber += (ushort)count;
+
+    /// <summary>
+    /// Test-only: tear down the sockets WITHOUT sending BY, to simulate a peer
+    /// that crashed / lost power / had its cable yanked. The remote side
+    /// should notice via its <see cref="PeerLivenessTimeout"/> watchdog.
+    /// No session-level state change is fired from this side beyond what
+    /// socket closure naturally produces (receive loops will complete).
+    /// </summary>
+    internal void SimulateAbruptDisconnect()
+    {
+        // Cancel loops first so they stop reading/writing on the sockets.
+        loopCts?.Cancel();
+        // Kill sockets without sending BY. The remote peer is left to
+        // discover the loss via silence.
+        try { controlSocket?.Close(); } catch { }
+        try { dataSocket?.Close();    } catch { }
+    }
 
     // --- SysEx reassembly state (receive side) ---
     private List<byte>? sysExBuffer;
@@ -229,13 +276,19 @@ public sealed class RtpMidiSession : IRtpMidiSession
             initiatorToken = AppleSessionProtocol.GenerateInitiatorToken();
         }
 
+        // Arm the peer-liveness watchdog as we enter Connected. Every
+        // subsequent inbound packet bumps this; ClockSyncLoopAsync tears
+        // the session down if the gap exceeds PeerLivenessTimeoutMs.
+        lastPacketRxUtc = DateTime.UtcNow;
+
         State = SessionState.Connected;
 
-        // Start receive loops and clock sync
+        // Start receive loops, clock sync, and peer-liveness watchdog.
         loopCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         receiveControlTask = ReceiveLoopAsync(controlSocket, isData: false, loopCts.Token);
         receiveDataTask    = ReceiveLoopAsync(dataSocket,    isData: true,  loopCts.Token);
         clockSyncTask      = ClockSyncLoopAsync(loopCts.Token);
+        peerLivenessTask   = PeerLivenessLoopAsync(loopCts.Token);
     }
 
     // -------------------------------------------------------------------------
@@ -332,12 +385,16 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     $"SSRC collision persisted after retry (remoteSsrc={remoteSsrc:X8}).");
         }
 
+        // Arm the peer-liveness watchdog (see note in ConnectAsync).
+        lastPacketRxUtc = DateTime.UtcNow;
+
         State = SessionState.Connected;
 
         loopCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         receiveControlTask = ReceiveLoopAsync(controlSocket, isData: false, loopCts.Token);
         receiveDataTask    = ReceiveLoopAsync(dataSocket,    isData: true,  loopCts.Token);
         clockSyncTask      = ClockSyncLoopAsync(loopCts.Token);
+        peerLivenessTask   = PeerLivenessLoopAsync(loopCts.Token);
     }
 
     // -------------------------------------------------------------------------
@@ -611,6 +668,11 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 var result = await socket.ReceiveAsync(ct);
                 var buf    = result.Buffer;
 
+                // Any inbound packet counts as liveness: session-protocol,
+                // clock sync, RTP data, receiver feedback. The watchdog
+                // in ClockSyncLoopAsync only needs "some byte arrived".
+                lastPacketRxUtc = DateTime.UtcNow;
+
                 if (AppleSessionProtocol.TryParse(buf, out var sessionPkt, out var clockPkt, out var feedbackPkt))
                 {
                     if (clockPkt != null)
@@ -652,13 +714,31 @@ public sealed class RtpMidiSession : IRtpMidiSession
                         if (TraceHook != null)
                             TraceHook($"[{localName}] RX session {sessionPkt.Command} ({(isData ? "data" : "control")}) from {result.RemoteEndPoint} remote='{sessionPkt.Name}' ssrc={sessionPkt.Ssrc:X8}");
 
-                        // Apple MIDI spec: when already connected, refuse new invitations on the
-                        // control port with NO so the initiator gives up immediately rather than
-                        // waiting for a timeout.
                         if (!isData
                             && sessionPkt.Command == AppleSessionCommand.Invitation
                             && State == SessionState.Connected)
                         {
+                            // Distinguish two cases:
+                            //   1) Same-endpoint reinvite with a NEW SSRC — the remote rebooted
+                            //      or its process restarted and we still think the old session
+                            //      is alive. Tear down our stale state so the peer can reconnect
+                            //      immediately instead of waiting out our liveness watchdog.
+                            //   2) Otherwise (different peer, or same-SSRC retransmit we shouldn't
+                            //      see mid-session) — refuse with NO so the caller gives up fast.
+                            bool sameEndpoint = remoteControlEp != null
+                                             && result.RemoteEndPoint.Equals(remoteControlEp);
+                            bool differentSsrc = sessionPkt.Ssrc != remoteSsrc;
+
+                            if (sameEndpoint && differentSsrc)
+                            {
+                                if (TraceHook != null)
+                                    TraceHook($"[{localName}] peer {result.RemoteEndPoint} reinvited with new SSRC ({remoteSsrc:X8} -> {sessionPkt.Ssrc:X8}); dropping stale session");
+                                // Fire-and-forget disconnect — we can't await from the RX loop
+                                // because DisconnectAsync cancels and awaits this loop.
+                                _ = DisconnectAsync();
+                                return;
+                            }
+
                             var no = new SessionPacket(
                                 AppleSessionCommand.InvitationRefused,
                                 AppleSessionProtocol.ProtocolVersion,
@@ -846,6 +926,56 @@ public sealed class RtpMidiSession : IRtpMidiSession
         catch (OperationCanceledException) { }
     }
 
+    /// <summary>
+    /// Peer-liveness watchdog. Runs alongside the clock-sync loop on its own
+    /// cadence — a fraction of <see cref="PeerLivenessTimeout"/> so detection
+    /// latency is within ~25% of the configured timeout regardless of how
+    /// short or long the user picks. If the remote has been silent for longer
+    /// than <see cref="PeerLivenessTimeout"/> while we're Connected we
+    /// conclude the session is dead (peer crashed, network partitioned, cable
+    /// unplugged) and tear down. <see cref="DisconnectAsync"/> fires
+    /// <see cref="StateChanges"/> so callers using
+    /// <see cref="ConnectWithReconnectAsync"/> / <see cref="ListenWithReconnectAsync"/>
+    /// can re-establish automatically.
+    /// </summary>
+    private async Task PeerLivenessLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                // Effective timeout respects the MinimumPeerLivenessTimeout
+                // floor so callers can't accidentally tune the watchdog into
+                // false-positive territory.
+                var timeout = PeerLivenessTimeout < MinimumPeerLivenessTimeout
+                    ? MinimumPeerLivenessTimeout
+                    : PeerLivenessTimeout;
+
+                // Check roughly four times per timeout window so detection is
+                // within ~25% of the configured value. Clamped: tests can set
+                // short timeouts and still get prompt detection.
+                var tick = TimeSpan.FromMilliseconds(
+                    Math.Max(MinimumPeerLivenessTimeout.TotalMilliseconds / 2.0,
+                             timeout.TotalMilliseconds / 4.0));
+
+                await Task.Delay(tick, ct);
+
+                if (State != SessionState.Connected) continue;
+
+                if ((DateTime.UtcNow - lastPacketRxUtc) > timeout)
+                {
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] peer silent for > {timeout}, tearing down session");
+                    // Fire-and-forget: DisconnectAsync cancels and awaits the
+                    // loop tasks, so awaiting from here would deadlock.
+                    _ = DisconnectAsync();
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
     private async Task RunClockSyncAsync(CancellationToken ct)
     {
         if (clockSync == null || controlSocket == null) return;
@@ -941,7 +1071,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private async Task StopLoopsAsync()
     {
         loopCts?.Cancel();
-        var tasks = new[] { receiveControlTask, receiveDataTask, clockSyncTask }
+        var tasks = new[] { receiveControlTask, receiveDataTask, clockSyncTask, peerLivenessTask }
             .Where(t => t != null)
             .Select(t => t!);
         try { await Task.WhenAll(tasks); } catch { }

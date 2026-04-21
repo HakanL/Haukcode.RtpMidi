@@ -3,13 +3,17 @@ using Haukcode.RtpMidi;
 namespace RtpMidi.Tests;
 
 /// <summary>
-/// Tests for recovery journal channel chapters V, P, C, M, W, N, Q, T, A
-/// and system chapter F (RFC 6295 Appendix A).
+/// Tests for the recovery journal channel chapters P, C, M, W, N, T, A and
+/// system chapter F. All byte-level assertions match RFC 6295 Appendix A
+/// verbatim.
 /// </summary>
 public class ChannelJournalTests
 {
     // =========================================================================
-    // Chapter P — Program Change
+    // Chapter P — Program Change (RFC 6295 §A.2)
+    //   Byte 0: S | PROGRAM[6:0]
+    //   Byte 1: B | BANK-MSB[6:0]   B = 1 if CC 0 was sent before this PC
+    //   Byte 2: X | BANK-LSB[6:0]   X = 1 if CC 32 was sent between MSB and PC
     // =========================================================================
 
     [Fact]
@@ -24,14 +28,11 @@ public class ChannelJournalTests
         var bytes = state.EncodeChapterP(isLast: true);
         Assert.Equal(3, bytes.Length);
 
-        // S=1 (isLast), B=0 (no bank), prog=42
-        // Byte 0: 1_0_prog[6:1] = 0x80 | (42 >> 1) = 0x80 | 0x15 = 0x95
-        Assert.Equal(0x95, bytes[0]);
-
-        // Byte 1: prog[0]_0_bc[6:1] = ((42 & 1) << 7) | 0 = 0 (prog=42 even)
+        // Byte 0: S=1 | PROGRAM=42 → 0x80 | 0x2A = 0xAA
+        Assert.Equal(0xAA, bytes[0]);
+        // Byte 1: B=0 (no bank sent before PC), BANK-MSB=0
         Assert.Equal(0x00, bytes[1]);
-
-        // Byte 2: bc[0]_bf[6:0] = 0
+        // Byte 2: X=0 (no bank-fine valid), BANK-LSB=0
         Assert.Equal(0x00, bytes[2]);
     }
 
@@ -46,15 +47,17 @@ public class ChannelJournalTests
         var bytes = state.EncodeChapterP(isLast: false);
         Assert.Equal(3, bytes.Length);
 
-        // B=1, X=1 (bank coarse active), prog=60
-        Assert.Equal(0, bytes[0] & 0x80); // S=0 (not last)
-        Assert.NotEqual(0, bytes[0] & 0x40); // B=1
+        // Byte 0: S=0 | PROGRAM=60 → 0x3C
+        Assert.Equal(0x3C, bytes[0]);
+        // Byte 1: B=1 | BANK-MSB=3 → 0x83
+        Assert.Equal(0x83, bytes[1]);
+        // Byte 2: X=1 | BANK-LSB=7 → 0x87
+        Assert.Equal(0x87, bytes[2]);
 
-        // Decode and verify
+        // Decode and verify round-trip
         var recovered = new List<byte[]>();
         int consumed = ChannelMidiState.DecodeChapterP(bytes, 0, recovered);
         Assert.Equal(3, consumed);
-        // Should emit: CC 0, CC 32, Program Change
         Assert.Equal(3, recovered.Count);
         Assert.Equal(new byte[] { 0xB0, 0, 3 }, recovered[0]);
         Assert.Equal(new byte[] { 0xB0, 32, 7 }, recovered[1]);
@@ -86,15 +89,14 @@ public class ChannelJournalTests
     [Fact]
     public void ChapterP_Program127_BitEncodingCorrect()
     {
-        // prog=127 = 0b1111111; bits 6:1 = 0b111111 = 63, bit 0 = 1
         var state = new ChannelMidiState();
         state.ProcessMidi([0xC0, 127]);
         var bytes = state.EncodeChapterP(isLast: true);
 
-        // Byte 0: S=1 | B=0 | prog[6:1]=0x3F → 0x80 | 0x3F = 0xBF
-        Assert.Equal(0xBF, bytes[0]);
-        // Byte 1: prog[0]=1 | X=0 | bc[6:1]=0 → 0x80
-        Assert.Equal(0x80, bytes[1]);
+        // Byte 0: S=1 | PROGRAM=127 → 0xFF
+        Assert.Equal(0xFF, bytes[0]);
+        // Byte 1: B=0 | BANK-MSB=0 → 0x00
+        Assert.Equal(0x00, bytes[1]);
 
         var recovered = new List<byte[]>();
         ChannelMidiState.DecodeChapterP(bytes, 0, recovered);
@@ -102,7 +104,9 @@ public class ChannelJournalTests
     }
 
     // =========================================================================
-    // Chapter C — Control Change
+    // Chapter C — Control Change (RFC 6295 §A.3)
+    //   Header: S | LEN[6:0]          LEN = (count − 1) in 7 bits
+    //   Entry:  S | NUMBER[6:0] | A | VALUE[6:0]   A = 0 = "value tool"
     // =========================================================================
 
     [Fact]
@@ -115,11 +119,12 @@ public class ChannelJournalTests
         // 1 header + 2 bytes per entry = 3 bytes
         Assert.Equal(3, bytes.Length);
 
-        // Header: S=1, ALT=0, LEN=1
-        Assert.Equal(0x81, bytes[0]);
-        // Entry: SFLAG=1 (last), NUM=7 → 0x80|7=0x87
+        // Header: S=1 | LEN=(count-1)=0 → 0x80
+        Assert.Equal(0x80, bytes[0]);
+        // Entry byte 0: S=1 (last) | NUMBER=7 → 0x87
         Assert.Equal(0x87, bytes[1]);
-        Assert.Equal(64, bytes[2]);
+        // Entry byte 1: A=0 | VALUE=64 → 0x40
+        Assert.Equal(0x40, bytes[2]);
     }
 
     [Fact]
@@ -460,26 +465,67 @@ public class ChannelJournalTests
     }
 
     // =========================================================================
-    // Chapter N — Note Off
+    // Chapter N — MIDI Note (both NoteOn and NoteOff) per RFC 6295 §A.6
+    //
+    //   Header (2 octets): B | LEN[6:0] | LOW[3:0] | HIGH[3:0]
+    //     LEN   = number of note-log entries (NoteOns)
+    //     LOW/HIGH = OFFBITS octet range. (LOW=15, HIGH=0 or 1) = empty offbits.
+    //   Note log entry (2 bytes): S | NOTENUM[6:0] | Y | VELOCITY[6:0]
+    //   OFFBITS octet: bit N represents note (8·oct + N), MSB = lowest note.
     // =========================================================================
 
     [Fact]
-    public void ChapterN_Encode_SingleNote_RoundTrip()
+    public void ChapterN_NoteOff_Encode_GoesToOffbits()
     {
+        // NoteOff on note 60 → OFFBITS, no log entry.
         var state = new ChannelMidiState();
-        state.ProcessMidi([0x80, 60, 0]); // Note Off, note 60, velocity 0
+        state.ProcessMidi([0x80, 60, 0]);
 
         var bytes = state.EncodeChapterN(isLast: true);
+        // Header (2) + empty log + 1 OFFBITS octet (note 60 lives in octet 7) = 3
         Assert.Equal(3, bytes.Length);
 
-        // S=1, B=0, LEN=1
-        Assert.Equal(0x81, bytes[0]);
+        // Header byte 0: B=1 | LEN=0 → 0x80
+        Assert.Equal(0x80, bytes[0]);
+        // Header byte 1: LOW=7 | HIGH=7 → 0x77 (single-octet range)
+        Assert.Equal(0x77, bytes[1]);
+        // OFFBITS octet for note 60: MSB of octet=note 56, note 60 = bit (60-56)=4 → 0x80>>4 = 0x08
+        Assert.Equal(0x08, bytes[2]);
 
         var recovered = new List<byte[]>();
         int consumed = ChannelMidiState.DecodeChapterN(bytes, 0, recovered);
         Assert.Equal(3, consumed);
         Assert.Single(recovered);
         Assert.Equal(new byte[] { 0x80, 60, 0 }, recovered[0]);
+    }
+
+    [Fact]
+    public void ChapterN_NoteOn_Encode_GoesToLogList()
+    {
+        // NoteOn note=60, vel=100 → single log entry, no offbits.
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0x90, 60, 100]);
+
+        Assert.True(state.HasNoteOn);
+
+        var bytes = state.EncodeChapterN(isLast: true);
+        // Header (2) + 1 log entry (2) + 0 offbits = 4
+        Assert.Equal(4, bytes.Length);
+
+        // Header byte 0: B=1 | LEN=1 → 0x81
+        Assert.Equal(0x81, bytes[0]);
+        // Header byte 1: empty OFFBITS sentinel (LOW=15, HIGH=0) → 0xF0
+        Assert.Equal(0xF0, bytes[1]);
+        // Log entry byte 0: S=1 (last) | NOTENUM=60 → 0xBC
+        Assert.Equal(0xBC, bytes[2]);
+        // Log entry byte 1: Y=0 | VELOCITY=100 → 0x64
+        Assert.Equal(0x64, bytes[3]);
+
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterN(bytes, 0, recovered);
+        Assert.Equal(4, consumed);
+        Assert.Single(recovered);
+        Assert.Equal(new byte[] { 0x90, 60, 100 }, recovered[0]);
     }
 
     [Fact]
@@ -493,72 +539,61 @@ public class ChannelJournalTests
     }
 
     [Fact]
-    public void ChapterN_Decode_MultipleNotes()
+    public void ChapterN_NoteOnThenNoteOff_MovesNoteToOffbits()
     {
-        var state = new ChannelMidiState();
-        state.ProcessMidi([0x80, 60, 32]);
-        state.ProcessMidi([0x80, 62, 0]);
-
-        var bytes = state.EncodeChapterN(isLast: false);
-        var recovered = new List<byte[]>();
-        int consumed = ChannelMidiState.DecodeChapterN(bytes, 0, recovered);
-
-        Assert.Equal(bytes.Length, consumed);
-        Assert.Equal(2, recovered.Count);
-    }
-
-    // =========================================================================
-    // Chapter Q — Note On
-    // =========================================================================
-
-    [Fact]
-    public void ChapterQ_Encode_SingleNote_RoundTrip()
-    {
-        var state = new ChannelMidiState();
-        state.ProcessMidi([0x90, 60, 100]); // Note On, note 60, velocity 100
-
-        Assert.True(state.HasNoteOn);
-
-        var bytes = state.EncodeChapterQ(isLast: true);
-        Assert.Equal(3, bytes.Length);
-
-        var recovered = new List<byte[]>();
-        int consumed = ChannelMidiState.DecodeChapterQ(bytes, 0, recovered);
-        Assert.Equal(3, consumed);
-        Assert.Single(recovered);
-        Assert.Equal(new byte[] { 0x90, 60, 100 }, recovered[0]);
-    }
-
-    [Fact]
-    public void ChapterQ_NoteOnThenOff_RemovedFromOnList()
-    {
+        // A note that was turned on and then off ends up only in OFFBITS
+        // (RFC §A.6: "A note number MUST NOT be coded in both structures").
         var state = new ChannelMidiState();
         state.ProcessMidi([0x90, 60, 100]); // Note On
-        state.ProcessMidi([0x80, 60, 0]);   // Note Off — should remove from on-list
+        state.ProcessMidi([0x80, 60, 0]);   // Note Off
 
         Assert.True(state.HasNoteOff);
-        // Note 60 should no longer be "on"
-        var bytes = state.EncodeChapterQ(isLast: true);
-        // Header only (LEN=0) if no notes are on
-        Assert.Single(bytes);
+        Assert.False(state.HasNoteOn);
+
+        var recovered = new List<byte[]>();
+        var bytes = state.EncodeChapterN(isLast: true);
+        ChannelMidiState.DecodeChapterN(bytes, 0, recovered);
+        // Exactly one recovered message — a NoteOff.
+        Assert.Single(recovered);
+        Assert.Equal(0x80, recovered[0][0]);
+        Assert.Equal(60,   recovered[0][1]);
     }
 
     [Fact]
-    public void ChapterQ_Decode_PolyphonicNotes()
+    public void ChapterN_PolyphonicNoteOns_AllRecovered()
     {
         var state = new ChannelMidiState();
         state.ProcessMidi([0x90, 60, 80]);
         state.ProcessMidi([0x90, 64, 90]);
         state.ProcessMidi([0x90, 67, 70]);
 
-        var bytes = state.EncodeChapterQ(isLast: true);
+        var bytes = state.EncodeChapterN(isLast: true);
         var recovered = new List<byte[]>();
-        ChannelMidiState.DecodeChapterQ(bytes, 0, recovered);
+        ChannelMidiState.DecodeChapterN(bytes, 0, recovered);
 
         Assert.Equal(3, recovered.Count);
         Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0x90, 60, 80 }));
         Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0x90, 64, 90 }));
         Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0x90, 67, 70 }));
+    }
+
+    [Fact]
+    public void ChapterN_MixedNotes_LogAndOffbitsBothPresent()
+    {
+        var state = new ChannelMidiState();
+        state.ProcessMidi([0x90, 60, 80]);  // NoteOn 60 → log
+        state.ProcessMidi([0x80, 64, 0]);   // NoteOff 64 → offbits
+        state.ProcessMidi([0x80, 66, 20]);  // NoteOff 66 → offbits (same octet 8)
+
+        var bytes = state.EncodeChapterN(isLast: true);
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterN(bytes, 0, recovered);
+        Assert.Equal(bytes.Length, consumed);
+
+        Assert.Equal(3, recovered.Count);
+        Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0x90, 60, 80 }));
+        Assert.Contains(recovered, m => m[0] == 0x80 && m[1] == 64);
+        Assert.Contains(recovered, m => m[0] == 0x80 && m[1] == 66);
     }
 
     // =========================================================================
@@ -928,37 +963,26 @@ public class ChannelJournalTests
     }
 
     // =========================================================================
-    // Chapter N — extended bitfield (B=1) skip
+    // Chapter N — empty OFFBITS sentinel handling
     // =========================================================================
 
     [Fact]
-    public void ChapterN_ExtendedBitfield_SkipsCorrectly()
+    public void ChapterN_EmptyOffbitsSentinel_LowIs15HighIs0_DecodesAsNoNoteOffs()
     {
-        // RFC 6295 §A.5: B=1 signals the extended bitfield mode.
-        // The decoder must skip 1 header byte + 16 bitfield bytes = 17 bytes total.
-        // Build a synthetic Chapter N with B=1 followed by a valid Chapter Q payload.
-
-        var chapterN = new byte[1 + 16]; // header + 16-byte bitfield
-        chapterN[0] = 0x40; // B=1, count=0 (extended bitfield mode, no list entries)
-        // Bitfield bytes (all zeros — no notes)
-        // chapterN[1..16] = 0
+        // RFC §A.6.1: (LOW=15, HIGH=0) and (LOW=15, HIGH=1) code "no OFFBITS".
+        // Chapter N with 1 NoteOn log entry and the (15, 0) sentinel.
+        var data = new byte[]
+        {
+            0x81,        // B=1, LEN=1
+            0xF0,        // LOW=15, HIGH=0 → no OFFBITS
+            0xBC, 0x64,  // S=1, NOTENUM=60, Y=0, VEL=100
+        };
 
         var recovered = new List<byte[]>();
-        int consumed = ChannelMidiState.DecodeChapterN(chapterN, 0, recovered);
-
-        // Should skip 17 bytes without error, yield no notes
-        Assert.Equal(17, consumed);
-        Assert.Empty(recovered);
-    }
-
-    [Fact]
-    public void ChapterN_ExtendedBitfield_TooShort_ReturnsError()
-    {
-        // Header says B=1 but buffer is too short to hold the 16-byte bitfield
-        var data = new byte[] { 0x40, 0x00, 0x00 }; // only 3 bytes instead of 17
-        var recovered = new List<byte[]>();
-        int result = ChannelMidiState.DecodeChapterN(data, 0, recovered);
-        Assert.Equal(-1, result);
+        int consumed = ChannelMidiState.DecodeChapterN(data, 0, recovered);
+        Assert.Equal(4, consumed);
+        Assert.Single(recovered);
+        Assert.Equal(new byte[] { 0x90, 60, 100 }, recovered[0]);
     }
 
     // =========================================================================

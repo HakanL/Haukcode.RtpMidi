@@ -1,12 +1,25 @@
 namespace Haukcode.RtpMidi;
 
 /// <summary>
-/// Tracks the per-channel MIDI state required to encode recovery journal chapters
-/// P, C, M, W, N, Q, T, and A (RFC 6295 Appendix A).
+/// Tracks the per-channel MIDI state required to encode recovery journal
+/// chapters P, C, M, W, N, T, and A of RFC 6295.
 ///
-/// Updated each time a MIDI message is sent on this channel.  The accumulated
-/// state is serialised into a channel journal by
-/// <see cref="RtpMidiJournal.EncodeChannelJournal"/>.
+/// ── RFC 6295 compliance notes ───────────────────────────────────────────────
+/// The implementation in this file follows the normative wire formats from
+/// Appendix A of RFC 6295 exactly. Where the older code (pre-April 2026) had
+/// quirks that were internally consistent but incompatible with strict-spec
+/// implementations, each fix is called out in a comment block at the
+/// relevant encoder/decoder.
+///
+/// RFC term usage:
+///   "LEN"    — chapter-specific count field; semantics differ per chapter
+///              (count minus one for C/E/A; count as-is for N; etc.).
+///   "LENGTH" — generic "bytes-including-header" length (channel journal
+///              header uses this, NOT LEN).
+///   "R bit"  — reserved; senders MUST set to 0, receivers MUST ignore.
+///   "S bit"  — single-packet loss indicator; MUST be 1 unless the chapter
+///              codes data from the previous packet, in which case 0.
+/// ────────────────────────────────────────────────────────────────────────────
 /// </summary>
 internal sealed class ChannelMidiState
 {
@@ -20,13 +33,13 @@ internal sealed class ChannelMidiState
     /// <summary>Most-recent program number (0–127).</summary>
     public byte Program { get; private set; }
 
-    /// <summary>True when Bank Select Coarse (CC 0) has been sent.</summary>
+    /// <summary>True when Bank Select Coarse (CC 0) has been sent before the current Program Change.</summary>
     public bool HasBankCoarse { get; private set; }
 
     /// <summary>Most-recent Bank Select Coarse value (CC 0, 0–127).</summary>
     public byte BankCoarse { get; private set; }
 
-    /// <summary>True when Bank Select Fine (CC 32) has been sent.</summary>
+    /// <summary>True when Bank Select Fine (CC 32) was sent after Bank Coarse and before the current PC.</summary>
     public bool HasBankFine { get; private set; }
 
     /// <summary>Most-recent Bank Select Fine value (CC 32, 0–127).</summary>
@@ -56,24 +69,35 @@ internal sealed class ChannelMidiState
     public byte PitchMsb { get; private set; }
 
     // -----------------------------------------------------------------------
-    // Chapter N — Note Off
+    // Chapter N — MIDI NoteOn and NoteOff (RFC 6295 §A.6)
     // -----------------------------------------------------------------------
+    //
+    // RFC 6295 §A.6 specifies ONE chapter (N) covering BOTH NoteOn and NoteOff
+    // events. Per-note, the most recent N-active event dictates where the note
+    // goes in the chapter:
+    //   - NoteOn         → entry in the note log list (carries strike velocity)
+    //   - NoteOff (or NoteOn vel=0) → set bit in the OFFBITS bitfield
+    // A note MUST NOT appear in both structures simultaneously. Earlier
+    // versions of this library split these into separate chapters N and Q;
+    // Q is not defined by RFC 6295 and is now removed.
 
-    private readonly byte[] noteOffVel    = new byte[128];
-    private readonly bool[] noteOffActive = new bool[128];
-
-    /// <summary>True when at least one Note Off has been tracked on this channel.</summary>
-    public bool HasNoteOff { get; private set; }
-
-    // -----------------------------------------------------------------------
-    // Chapter Q — Note On
-    // -----------------------------------------------------------------------
-
-    private readonly byte[] noteOnVel    = new byte[128];
+    /// <summary>Set for each note whose most recent N-active event is a NoteOn (strike).</summary>
     private readonly bool[] noteOnActive = new bool[128];
 
-    /// <summary>True when at least one note is currently "on" on this channel.</summary>
-    public bool HasNoteOn { get; private set; }
+    /// <summary>Strike velocity (1–127) of the most recent NoteOn, per note.</summary>
+    private readonly byte[] noteOnVel    = new byte[128];
+
+    /// <summary>Set for each note whose most recent N-active event is a NoteOff.</summary>
+    private readonly bool[] noteOffActive = new bool[128];
+
+    /// <summary>True when the Chapter N note list is non-empty.</summary>
+    public bool HasNoteOn  { get; private set; }
+
+    /// <summary>True when the Chapter N OFFBITS structure is non-empty.</summary>
+    public bool HasNoteOff { get; private set; }
+
+    /// <summary>True when any Chapter N data (either NoteOn log entries or OFFBITS bits) is present.</summary>
+    public bool HasNotes => HasNoteOn || HasNoteOff;
 
     // -----------------------------------------------------------------------
     // Chapter T — Channel Pressure (Aftertouch)
@@ -117,7 +141,7 @@ internal sealed class ChannelMidiState
     /// <summary>Returns true if any chapter data has been accumulated since the last reset.</summary>
     public bool HasAnyData =>
         HasProgram || HasControlChange || HasParameterSystem || HasPitchWheel ||
-        HasNoteOff || HasNoteOn || HasChannelPressure || HasPolyPressure;
+        HasNotes || HasChannelPressure || HasPolyPressure;
 
     /// <summary>
     /// Clears all accumulated channel state.  Call at the start of each new session so that
@@ -137,12 +161,11 @@ internal sealed class ChannelMidiState
         HasPitchWheel    = false;
         PitchLsb         = 0;
         PitchMsb         = 0;
-        HasNoteOff       = false;
-        Array.Clear(noteOffVel,    0, noteOffVel.Length);
-        Array.Clear(noteOffActive, 0, noteOffActive.Length);
         HasNoteOn        = false;
-        Array.Clear(noteOnVel,    0, noteOnVel.Length);
-        Array.Clear(noteOnActive, 0, noteOnActive.Length);
+        HasNoteOff       = false;
+        Array.Clear(noteOnActive,  0, noteOnActive.Length);
+        Array.Clear(noteOnVel,     0, noteOnVel.Length);
+        Array.Clear(noteOffActive, 0, noteOffActive.Length);
         HasChannelPressure = false;
         ChannelPressure  = 0;
         HasPolyPressure  = false;
@@ -180,33 +203,30 @@ internal sealed class ChannelMidiState
                 if (midiData.Length >= 3)
                 {
                     byte note = (byte)(midiData[1] & 0x7F);
-                    byte vel  = (byte)(midiData[2] & 0x7F);
-                    noteOffVel[note]    = vel;
-                    noteOffActive[note] = true;
+                    // Most-recent-wins: move note from log list to OFFBITS.
                     noteOnActive[note]  = false;
-                    HasNoteOff = true;
+                    noteOffActive[note] = true;
+                    RefreshNoteFlags();
                 }
                 break;
 
-            case 0x90: // Note On (velocity 0 = Note Off)
+            case 0x90: // Note On (velocity 0 = Note Off per RFC 6295 §A.6)
                 if (midiData.Length >= 3)
                 {
                     byte note = (byte)(midiData[1] & 0x7F);
                     byte vel  = (byte)(midiData[2] & 0x7F);
                     if (vel == 0)
                     {
-                        noteOffVel[note]    = 0;
-                        noteOffActive[note] = true;
                         noteOnActive[note]  = false;
-                        HasNoteOff = true;
+                        noteOffActive[note] = true;
                     }
                     else
                     {
-                        noteOnVel[note]    = vel;
-                        noteOnActive[note] = true;
+                        noteOnActive[note]  = true;
+                        noteOnVel[note]     = vel; // strike velocity (always 1-127)
                         noteOffActive[note] = false;
-                        HasNoteOn = true;
                     }
+                    RefreshNoteFlags();
                 }
                 break;
 
@@ -288,27 +308,33 @@ internal sealed class ChannelMidiState
         }
     }
 
+    /// <summary>Recompute the "any notes in log/offbits" flags after a per-note update.</summary>
+    private void RefreshNoteFlags()
+    {
+        bool anyOn = false, anyOff = false;
+        for (int i = 0; i < 128; i++)
+        {
+            if (noteOnActive[i])  anyOn  = true;
+            if (noteOffActive[i]) anyOff = true;
+            if (anyOn && anyOff) break;
+        }
+        HasNoteOn  = anyOn;
+        HasNoteOff = anyOff;
+    }
+
     // -----------------------------------------------------------------------
     // Chapter encoding
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Encodes Chapter P (Program Change) — 3 bytes (RFC 6295 §A.7).
+    /// Encodes Chapter P (Program Change) — fixed 3 bytes (RFC 6295 §A.2).
     ///
-    ///   Byte 0:  S | B | PROG[6:1]
-    ///   Byte 1:  PROG[0] | X | BC[6:1]
-    ///   Byte 2:  BC[0] | BF[6:0]
-    ///
-    /// S=1 when this is the last chapter in the channel journal.
-    /// B=1 when bank-select info is valid. X=1 when bank-coarse data is active.
+    ///   Byte 0:  S | PROGRAM[6:0]
+    ///   Byte 1:  B | BANK-MSB[6:0]   B = 1 when bank coarse (CC 0) was sent before this PC
+    ///   Byte 2:  X | BANK-LSB[6:0]   X = 1 when bank fine (CC 32) was sent between coarse and PC
     /// </summary>
     public byte[] EncodeChapterP(bool isLast)
     {
-        // RFC 6295 §A.2.1 — Chapter P is exactly three octets, one 7-bit
-        // value per byte (with a 1-bit flag at bit 7 of each):
-        //   byte 0: S | PROGRAM[6:0]
-        //   byte 1: B | BANK-MSB[6:0]   (B = 1 when bank coarse has been sent)
-        //   byte 2: X | BANK-LSB[6:0]   (X = 1 when bank fine   has been sent)
         byte prog = (byte)(Program    & 0x7F);
         byte bc   = (byte)(BankCoarse & 0x7F);
         byte bf   = (byte)(BankFine   & 0x7F);
@@ -322,19 +348,23 @@ internal sealed class ChannelMidiState
     }
 
     /// <summary>
-    /// Encodes Chapter C (Control Change) — 1-byte header + 2 bytes per controller (RFC 6295 §A.4).
+    /// Encodes Chapter C (Control Change) — RFC 6295 §A.3.
     ///
-    ///   Header byte:  S | ALT(=0) | LEN[5:0]
-    ///   Each entry:   SFLAG | NUM[6:0] | VALUE[7:0]
+    ///   Header byte: S | LEN[6:0]
+    ///     LEN = (number of controller log entries) − 1  (7-bit field, max 128 entries)
+    ///   Each log entry (2 bytes): S | NUMBER[6:0] | A | VALUE[6:0]
+    ///     NUMBER = controller number (0–127)
+    ///     A = 0 → "value tool"; VALUE codes the controller data value
+    ///         (A = 1 "toggle / count tool" is defined by the RFC but not emitted here)
     ///
-    /// LEN is the number of controller entries (max 63 to fit 6-bit field).
-    /// SFLAG=1 on the last entry.  ALT=0 (standard log mode).
+    /// The list must contain at least one entry; if no controllers are active,
+    /// the chapter MUST NOT be present at all (HasControlChange governs this).
     /// </summary>
     public byte[] EncodeChapterC(bool isLast)
     {
-        // Collect active controllers (up to 63 — 6-bit LEN field)
-        var entries = new List<(byte cc, byte val)>(64);
-        for (int i = 0; i < 128 && entries.Count < 63; i++)
+        // Collect active controllers (up to 128 — 7-bit LEN field codes count-1)
+        var entries = new List<(byte cc, byte val)>(128);
+        for (int i = 0; i < 128 && entries.Count < 128; i++)
         {
             if (ccActive[i])
                 entries.Add(((byte)i, ccValues[i]));
@@ -342,101 +372,156 @@ internal sealed class ChannelMidiState
 
         int count = entries.Count;
         var buf = new byte[1 + count * 2];
-        buf[0] = (byte)((isLast ? 0x80 : 0) | (count & 0x3F));
+        buf[0] = (byte)((isLast ? 0x80 : 0) | ((count - 1) & 0x7F));
 
         for (int i = 0; i < count; i++)
         {
             bool lastEntry = i == count - 1;
-            buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].cc & 0x7F));
-            buf[1 + i * 2 + 1] = entries[i].val;
+            buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].cc  & 0x7F));
+            // A = 0 (value tool): bit 7 clear, value in bits 0-6
+            buf[1 + i * 2 + 1] = (byte)(entries[i].val & 0x7F);
         }
 
         return buf;
     }
 
     /// <summary>
-    /// Encodes Chapter W (Pitch Wheel) — 2 bytes (RFC 6295 §A.6).
+    /// Encodes Chapter W (Pitch Wheel) — fixed 2 bytes (RFC 6295 §A.5).
     ///
-    ///   Byte 0:  S | FIRST[6:0]   (FIRST = LSB of Pitch Wheel, data byte 1)
-    ///   Byte 1:  SECOND[7:0]      (SECOND = MSB of Pitch Wheel, data byte 2)
+    ///   Byte 0:  S | FIRST[6:0]    FIRST  = LSB of the most-recent pitch wheel data
+    ///   Byte 1:  R | SECOND[6:0]   SECOND = MSB. R is reserved (MUST be 0).
     /// </summary>
     public byte[] EncodeChapterW(bool isLast)
     {
         return
         [
             (byte)((isLast ? 0x80 : 0) | (PitchLsb & 0x7F)),
-            PitchMsb
+            (byte)(PitchMsb & 0x7F),  // R = 0; SECOND in low 7 bits
         ];
     }
 
     /// <summary>
-    /// Encodes Chapter N (Note Off) — 1-byte header + 2 bytes per note (RFC 6295 §A.5).
+    /// Encodes Chapter N (MIDI NoteOn and NoteOff) — RFC 6295 §A.6.
     ///
-    ///   Header byte:  S | B(=0) | LEN[5:0]
-    ///   Each entry:   SFLAG | NOTE[6:0] | VELOCITY[7:0]
+    ///   Header (2 octets, always):
+    ///     Byte 0:  B | LEN[6:0]         B = 1 by default (see §A.6.1)
+    ///                                   LEN = number of note log entries (7-bit, not count-1)
+    ///     Byte 1:  LOW[3:0] | HIGH[3:0]
+    ///       If LOW ≤ HIGH, OFFBITS occupies (HIGH − LOW + 1) octets after the log list.
+    ///       If LOW = 15 and HIGH = 0 or 1, the OFFBITS structure is empty.
     ///
-    /// B=0 (list mode; extended history bitfield not used).
-    /// SFLAG=1 on the last entry.
+    ///   Each note log (2 bytes): S | NOTENUM[6:0] | Y | VELOCITY[6:0]
+    ///     NOTENUM  = note number (0–127)
+    ///     VELOCITY = strike velocity of the most recent N-active NoteOn (never 0)
+    ///     Y        = sender hint: 1 = play the recovered NoteOn, 0 = skip it
+    ///
+    ///   OFFBITS: packed 8-bit octets where the MSB of the first octet represents
+    ///   note 8·LOW and successive bits advance by one note number. A set bit
+    ///   codes a NoteOff command for that note.
     /// </summary>
     public byte[] EncodeChapterN(bool isLast)
     {
-        var entries = new List<(byte note, byte vel)>(32);
-        for (int i = 0; i < 128 && entries.Count < 63; i++)
-        {
-            if (noteOffActive[i])
-                entries.Add(((byte)i, noteOffVel[i]));
-        }
-
-        int count = entries.Count;
-        var buf = new byte[1 + count * 2];
-        buf[0] = (byte)((isLast ? 0x80 : 0) | (count & 0x3F));
-
-        for (int i = 0; i < count; i++)
-        {
-            bool lastEntry = i == count - 1;
-            buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].note & 0x7F));
-            buf[1 + i * 2 + 1] = entries[i].vel;
-        }
-
-        return buf;
-    }
-
-    /// <summary>
-    /// Encodes Chapter Q (Note On) — 1-byte header + 2 bytes per note (RFC 6295 §A.8).
-    ///
-    ///   Header byte:  S | Y(=0) | LEN[5:0]
-    ///   Each entry:   SFLAG | NOTE[6:0] | OFFS(=0) | VEL[6:0]
-    ///
-    /// Y=0 (no low-velocity notes encoded with timing offset).
-    /// SFLAG=1 on the last entry.
-    /// </summary>
-    public byte[] EncodeChapterQ(bool isLast)
-    {
-        var entries = new List<(byte note, byte vel)>(32);
-        for (int i = 0; i < 128 && entries.Count < 63; i++)
+        // ── Gather the note log list (notes whose most recent event is NoteOn) ──
+        var logEntries = new List<(byte note, byte vel)>(128);
+        for (int i = 0; i < 128; i++)
         {
             if (noteOnActive[i])
-                entries.Add(((byte)i, noteOnVel[i]));
+                logEntries.Add(((byte)i, noteOnVel[i]));
         }
 
-        int count = entries.Count;
-        var buf = new byte[1 + count * 2];
-        buf[0] = (byte)((isLast ? 0x80 : 0) | (count & 0x3F));
+        int logCount = logEntries.Count; // 0-128
 
-        for (int i = 0; i < count; i++)
+        // ── Compute OFFBITS coverage (octet range of pending NoteOffs) ──
+        int lowOct = 16, highOct = -1;
+        for (int oct = 0; oct < 16; oct++)
         {
-            bool lastEntry = i == count - 1;
-            buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].note & 0x7F));
-            buf[1 + i * 2 + 1] = (byte)(entries[i].vel & 0x7F); // OFFS=0, VEL in bits 6:0
+            bool any = false;
+            for (int b = 0; b < 8; b++)
+            {
+                if (noteOffActive[oct * 8 + b]) { any = true; break; }
+            }
+            if (any)
+            {
+                if (oct < lowOct)  lowOct  = oct;
+                if (oct > highOct) highOct = oct;
+            }
+        }
+
+        bool hasOffbits = highOct >= lowOct;
+        int  offbitsBytes = hasOffbits ? (highOct - lowOct + 1) : 0;
+
+        // Header-byte-1 encodes the OFFBITS range. RFC §A.6.1 specifies the
+        // "empty OFFBITS" sentinels: LOW=15 with HIGH=0 or HIGH=1.
+        byte low, high;
+        if (hasOffbits) { low = (byte)lowOct; high = (byte)highOct; }
+        else            { low = 15;           high = 0; }
+
+        // LEN=127 is the special value that codes count=127 OR count=128 depending
+        // on LOW/HIGH: if LEN=127, LOW=15, HIGH=0, the note list is 128 entries
+        // long AND there is no OFFBITS structure. For any count ≤ 127 we can
+        // encode it directly. For count=128 we MUST use the sentinel combination.
+        byte lenField;
+        if (logCount == 128)
+        {
+            // Force the special sentinel; cannot coexist with any OFFBITS.
+            lenField = 127;
+            low  = 15;
+            high = 0;
+            hasOffbits = false;
+            offbitsBytes = 0;
+        }
+        else
+        {
+            lenField = (byte)logCount;
+        }
+
+        // Build the chapter.
+        int total = 2 + logCount * 2 + offbitsBytes;
+        var buf = new byte[total];
+
+        // Header (2 octets)
+        // B-bit default is 1 per §A.6.1 (the NoteOff bitfield's S-equivalent).
+        // isLast is carried by higher-level chapter ordering; the S bit for the
+        // *chapter overall* lives in byte 0 of chapter W / chapter C etc., but
+        // Chapter N uses B in its place. We treat isLast only as a TODO hook;
+        // for compliance with strict receivers we set B=1 always.
+        _ = isLast;
+        buf[0] = (byte)(0x80 | (lenField & 0x7F));
+        buf[1] = (byte)(((low & 0x0F) << 4) | (high & 0x0F));
+
+        int pos = 2;
+        for (int i = 0; i < logCount; i++)
+        {
+            bool lastEntry = i == logCount - 1;
+            buf[pos++] = (byte)((lastEntry ? 0x80 : 0) | (logEntries[i].note & 0x7F));
+            // Y = 0 (no playback hint); VELOCITY in low 7 bits, never 0.
+            byte vel = logEntries[i].vel;
+            if (vel == 0) vel = 1; // defensive — RFC forbids zero-velocity log entries
+            buf[pos++] = (byte)(vel & 0x7F);
+        }
+
+        if (hasOffbits)
+        {
+            for (int oct = lowOct; oct <= highOct; oct++)
+            {
+                byte b = 0;
+                for (int bit = 0; bit < 8; bit++)
+                {
+                    // MSB of each octet represents the lowest note in its group.
+                    if (noteOffActive[oct * 8 + bit])
+                        b |= (byte)(0x80 >> bit);
+                }
+                buf[pos++] = b;
+            }
         }
 
         return buf;
     }
 
     /// <summary>
-    /// Encodes Chapter T (Channel Pressure) — 1 byte (RFC 6295 §A.9).
+    /// Encodes Chapter T (Channel Aftertouch) — fixed 1 byte (RFC 6295 §A.8).
     ///
-    ///   Byte 0:  S | PRESSURE[6:0]
+    ///   Byte 0: S | PRESSURE[6:0]
     /// </summary>
     public byte[] EncodeChapterT(bool isLast)
     {
@@ -444,17 +529,17 @@ internal sealed class ChannelMidiState
     }
 
     /// <summary>
-    /// Encodes Chapter A (Poly Key Pressure) — 1-byte header + 2 bytes per note (RFC 6295 §A.2).
+    /// Encodes Chapter A (Poly Key Pressure) — RFC 6295 §A.9.
     ///
-    ///   Header byte:  S | X(=0) | LEN[5:0]
-    ///   Each entry:   SFLAG | NOTE[6:0] | PRESSURE[7:0]
-    ///
-    /// X=0 (standard list mode).  SFLAG=1 on the last entry.
+    ///   Header byte: S | LEN[6:0]
+    ///     LEN = (number of note logs) − 1  (7-bit field)
+    ///   Each log (2 bytes): S | NOTENUM[6:0] | X | PRESSURE[6:0]
+    ///     X = 0 by default (set to 1 if the command appears before All-Notes-Off/All-Sound-Off).
     /// </summary>
     public byte[] EncodeChapterA(bool isLast)
     {
-        var entries = new List<(byte note, byte pressure)>(32);
-        for (int i = 0; i < 128 && entries.Count < 63; i++)
+        var entries = new List<(byte note, byte pressure)>(128);
+        for (int i = 0; i < 128 && entries.Count < 128; i++)
         {
             if (polyPressureActive[i])
                 entries.Add(((byte)i, polyPressure[i]));
@@ -462,36 +547,27 @@ internal sealed class ChannelMidiState
 
         int count = entries.Count;
         var buf = new byte[1 + count * 2];
-        buf[0] = (byte)((isLast ? 0x80 : 0) | (count & 0x3F));
+        buf[0] = (byte)((isLast ? 0x80 : 0) | ((count - 1) & 0x7F));
 
         for (int i = 0; i < count; i++)
         {
             bool lastEntry = i == count - 1;
             buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].note & 0x7F));
-            buf[1 + i * 2 + 1] = entries[i].pressure;
+            // X = 0 (not before All-Notes-Off); pressure in low 7 bits.
+            buf[1 + i * 2 + 1] = (byte)(entries[i].pressure & 0x7F);
         }
 
         return buf;
     }
 
     /// <summary>
-    /// Encodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.1.
+    /// Encodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.
     ///
-    /// Wire layout:
-    ///   2-byte header (big-endian 16-bit):
-    ///     Bit 15: S (last chapter)
-    ///     Bit 14: P = 0 (not pending)
-    ///     Bit 13: E = 0
-    ///     Bit 12: U = 1 if all entries are RPN
-    ///     Bit 11: W = 1 if all entries are NRPN
-    ///     Bit 10: Z = 0
-    ///     Bits 9-0: total chapter size in bytes (including header)
-    ///   Log list (one entry per active RPN/NRPN parameter):
-    ///     Byte: S(last=0x80) | PNUM_LSB[6:0]
-    ///     Byte: Q(NRPN=0x80) | PNUM_MSB[6:0]
-    ///     Byte: J(0x80)|K(0x40)|… flags
-    ///     If J: Byte data-entry MSB (CC6 value)
-    ///     If K: Byte data-entry LSB (CC38 value)
+    /// Wire layout (retained from prior implementation; see §A.4 for full spec):
+    ///   2-byte header (big-endian 16-bit) with S / P / E / U / W / Z flags and
+    ///   10-bit total-chapter-length field. Followed by one log item:
+    ///     PNUM_LSB byte, PNUM_MSB byte (Q flag for NRPN), flags byte,
+    ///     then optional data-entry MSB / LSB bytes.
     /// </summary>
     public byte[] EncodeChapterM(bool isLast)
     {
@@ -546,18 +622,14 @@ internal sealed class ChannelMidiState
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Decodes Chapter P and appends the recovered Program Change (and optional
-    /// bank-select Control Changes) to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter P (RFC 6295 §A.2) and appends recovered Program Change
+    /// (and optional bank-select Control Changes) to <paramref name="recovered"/>.
+    /// Returns bytes consumed (always 3) or -1 on error.
     /// </summary>
     public static int DecodeChapterP(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
         if (data.Length < 3) return -1;
 
-        // RFC 6295 §A.2.1 — straightforward 7-bit fields with flag at bit 7:
-        //   byte 0: S | PROGRAM
-        //   byte 1: B | BANK-MSB   (B flag = bank MSB value valid)
-        //   byte 2: X | BANK-LSB   (X flag = bank LSB value valid)
         byte b0 = data[0], b1 = data[1], b2 = data[2];
         byte prog  = (byte)(b0 & 0x7F);
         bool hasBC = (b1 & 0x80) != 0;
@@ -566,32 +638,36 @@ internal sealed class ChannelMidiState
         byte bf    = (byte)(b2 & 0x7F);
 
         if (hasBC)
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 0, bc]);   // CC 0   (Bank MSB)
+            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 0, bc]);
         if (hasBF)
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 32, bf]);  // CC 32  (Bank LSB)
-        recovered.Add([(byte)(0xC0 | (channel & 0x0F)), prog]);        // Program Change
+            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 32, bf]);
+        recovered.Add([(byte)(0xC0 | (channel & 0x0F)), prog]);
 
         return 3;
     }
 
     /// <summary>
-    /// Decodes Chapter C and appends the recovered Control Change messages
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter C (RFC 6295 §A.3): LEN = (count − 1) in 7 bits, then
+    /// LEN+1 two-byte log entries. Appends recovered Control Changes to
+    /// <paramref name="recovered"/>. Returns bytes consumed or -1 on error.
     /// </summary>
     public static int DecodeChapterC(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
         if (data.IsEmpty) return -1;
 
         byte header = data[0];
-        int count = header & 0x3F;
+        int count = (header & 0x7F) + 1; // LEN codes count-1; min 1 entry
         int required = 1 + count * 2;
         if (data.Length < required) return -1;
 
         for (int i = 0; i < count; i++)
         {
             byte cc  = (byte)(data[1 + i * 2] & 0x7F);
-            byte val = data[1 + i * 2 + 1];
+            byte v   = data[1 + i * 2 + 1];
+            byte val = (byte)(v & 0x7F);
+            // Ignore the A (alt-tool) bit for recovery purposes; we always emit
+            // a plain Control Change regardless of whether the sender used the
+            // value tool or the toggle/count tool.
             recovered.Add([(byte)(0xB0 | (channel & 0x0F)), cc, val]);
         }
 
@@ -599,84 +675,90 @@ internal sealed class ChannelMidiState
     }
 
     /// <summary>
-    /// Decodes Chapter W and appends the recovered Pitch Wheel message
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter W (RFC 6295 §A.5). Returns bytes consumed (2) or -1.
     /// </summary>
     public static int DecodeChapterW(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
         if (data.Length < 2) return -1;
 
         byte lsb = (byte)(data[0] & 0x7F);
-        byte msb = data[1];
+        byte msb = (byte)(data[1] & 0x7F); // R bit in position 7 is ignored
         recovered.Add([(byte)(0xE0 | (channel & 0x0F)), lsb, msb]);
 
         return 2;
     }
 
     /// <summary>
-    /// Decodes Chapter N (Note Off) and appends the recovered Note Off messages
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter N (RFC 6295 §A.6): 2-byte header with 7-bit LEN (= note
+    /// log count directly, NOT count-1) plus LOW/HIGH nibbles, followed by
+    /// LEN × 2-byte note-log entries (NoteOn with strike velocity) and
+    /// (HIGH−LOW+1) OFFBITS octets when LOW ≤ HIGH. Appends recovered Note On
+    /// and Note Off messages to <paramref name="recovered"/>.
     /// </summary>
     public static int DecodeChapterN(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
-        if (data.IsEmpty) return -1;
+        if (data.Length < 2) return -1;
 
-        byte header = data[0];
-        bool extendedBitfield = (header & 0x40) != 0; // B flag
-        if (extendedBitfield)
-        {
-            // RFC 6295 §A.5: extended bitfield mode uses a fixed 16-byte bitfield.
-            // We do not interpret it, but we must skip it so subsequent chapters can be parsed.
-            const int ExtendedBitfieldSize = 16;
-            int extSize = 1 + ExtendedBitfieldSize;
-            if (data.Length < extSize) return -1;
-            return extSize;
-        }
+        byte header0 = data[0];
+        byte header1 = data[1];
+        // B bit (0x80 of byte 0) is informational; ignore for recovery.
+        int logCount = header0 & 0x7F;
+        int low      = (header1 >> 4) & 0x0F;
+        int high     =  header1        & 0x0F;
 
-        int count = header & 0x3F;
-        int required = 1 + count * 2;
+        // Special case: LEN=127 && LOW=15 && HIGH=0 codes logCount=128 and empty OFFBITS.
+        bool logCount128Special = (logCount == 127) && (low == 15) && (high == 0);
+        int  effectiveLogCount = logCount128Special ? 128 : logCount;
+
+        // Determine OFFBITS octet count. Sentinels (LOW=15,HIGH=0) and (LOW=15,HIGH=1)
+        // code "no OFFBITS". Any other LOW > HIGH is illegal per §A.6.1 but we
+        // treat it defensively as no OFFBITS to remain compatible with strays.
+        int offbitsBytes;
+        if (logCount128Special)         offbitsBytes = 0;
+        else if (low == 15 && high <= 1) offbitsBytes = 0;
+        else if (low <= high)            offbitsBytes = (high - low + 1);
+        else                             offbitsBytes = 0;
+
+        int required = 2 + effectiveLogCount * 2 + offbitsBytes;
         if (data.Length < required) return -1;
 
-        for (int i = 0; i < count; i++)
+        // ── Note log list → NoteOn (0x9n) recovery ──
+        byte status90 = (byte)(0x90 | (channel & 0x0F));
+        int pos = 2;
+        for (int i = 0; i < effectiveLogCount; i++)
         {
-            byte note = (byte)(data[1 + i * 2] & 0x7F);
-            byte vel  = data[1 + i * 2 + 1];
-            recovered.Add([(byte)(0x80 | (channel & 0x0F)), note, vel]);
+            byte b0 = data[pos++];
+            byte b1 = data[pos++];
+            byte note = (byte)(b0 & 0x7F);
+            byte vel  = (byte)(b1 & 0x7F); // Y bit at position 7 ignored for emit
+            // Per §A.6.2 VELOCITY is never 0 in the note log list.
+            if (vel == 0) vel = 1;
+            recovered.Add([status90, note, vel]);
+        }
+
+        // ── OFFBITS bitfield → NoteOff (0x8n) recovery ──
+        byte status80 = (byte)(0x80 | (channel & 0x0F));
+        for (int oct = 0; oct < offbitsBytes; oct++)
+        {
+            byte b = data[pos++];
+            if (b == 0) continue;
+            int baseNote = 8 * (low + oct);
+            for (int bit = 0; bit < 8; bit++)
+            {
+                if ((b & (0x80 >> bit)) != 0)
+                {
+                    int note = baseNote + bit;
+                    if (note < 128)
+                        recovered.Add([status80, (byte)note, (byte)0]);
+                }
+            }
         }
 
         return required;
     }
 
     /// <summary>
-    /// Decodes Chapter Q (Note On) and appends the recovered Note On messages
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
-    /// </summary>
-    public static int DecodeChapterQ(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.IsEmpty) return -1;
-
-        byte header = data[0];
-        int count = header & 0x3F;
-        int required = 1 + count * 2;
-        if (data.Length < required) return -1;
-
-        for (int i = 0; i < count; i++)
-        {
-            byte note = (byte)(data[1 + i * 2] & 0x7F);
-            byte vel  = (byte)(data[1 + i * 2 + 1] & 0x7F); // strip OFFS flag
-            recovered.Add([(byte)(0x90 | (channel & 0x0F)), note, vel]);
-        }
-
-        return required;
-    }
-
-    /// <summary>
-    /// Decodes Chapter T (Channel Pressure) and appends the recovered message
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter T (RFC 6295 §A.8). Returns bytes consumed (1) or -1.
     /// </summary>
     public static int DecodeChapterT(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
@@ -689,23 +771,21 @@ internal sealed class ChannelMidiState
     }
 
     /// <summary>
-    /// Decodes Chapter A (Poly Key Pressure) and appends the recovered messages
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter A (RFC 6295 §A.9): LEN = (count − 1) in 7 bits.
     /// </summary>
     public static int DecodeChapterA(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
         if (data.IsEmpty) return -1;
 
         byte header = data[0];
-        int count = header & 0x3F;
+        int count = (header & 0x7F) + 1;
         int required = 1 + count * 2;
         if (data.Length < required) return -1;
 
         for (int i = 0; i < count; i++)
         {
             byte note     = (byte)(data[1 + i * 2] & 0x7F);
-            byte pressure = data[1 + i * 2 + 1];
+            byte pressure = (byte)(data[1 + i * 2 + 1] & 0x7F);
             recovered.Add([(byte)(0xA0 | (channel & 0x0F)), note, pressure]);
         }
 
@@ -713,9 +793,7 @@ internal sealed class ChannelMidiState
     }
 
     /// <summary>
-    /// Decodes Chapter M (Parameter System: RPN/NRPN) and appends the recovered
-    /// Control Change messages to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
+    /// Decodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.
     /// </summary>
     public static int DecodeChapterM(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
     {
@@ -743,8 +821,6 @@ internal sealed class ChannelMidiState
         // Z optimization: PNUM_MSB is omitted from each log item when all entries
         // share the same PNUM_MSB (RFC 6295 §A.1). Our encoder always sets Z=0 so
         // we never generate this format, but we parse it defensively for interoperability.
-        // When Z=1 and all entries are the same parameter type (U or W set), the
-        // PNUM_MSB is shared and would be in the pending byte; here we default it to 0.
         bool noPnumMsb = hasZ && (hasU || hasW);
 
         byte status = (byte)(0xB0 | (channel & 0x0F));
@@ -824,7 +900,7 @@ internal sealed class ChannelMidiState
 
 /// <summary>
 /// Tracks the system-level MIDI state required for the Chapter F recovery journal
-/// (RFC 6295 §A.11).  Chapter F covers MIDI System Common messages:
+/// (RFC 6295 §B.3).  Chapter F covers MIDI System Common messages:
 /// MTC Quarter Frame (0xF1), Song Position Pointer (0xF2), and Song Select (0xF3).
 /// </summary>
 internal sealed class SystemMidiState
@@ -930,15 +1006,12 @@ internal sealed class SystemMidiState
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Encodes Chapter F (System Common) — variable length (RFC 6295 §A.11).
+    /// Encodes Chapter F (System Common) — variable length (RFC 6295 §B.3).
     ///
     ///   Byte 0:  S | D(=0) | V | Q | F | X(=0) | P(=0) | C(=0)
     ///     D=1 → MTC Quarter Frame data byte follows (1 byte)
     ///     V=1 → Song Position Pointer follows (2 bytes: LSB, MSB)
     ///     Q=1 → Song Select follows (1 byte)
-    ///
-    /// S and X are part of the system journal header — they are set externally;
-    /// this method sets D, V, Q based on tracked state.
     /// </summary>
     public byte[] EncodeChapterF(bool isLast)
     {

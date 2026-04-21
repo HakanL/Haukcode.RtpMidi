@@ -24,11 +24,15 @@ namespace Haukcode.RtpMidi;
 ///     Chapter X (if present): 2-byte header + SysEx data
 ///
 ///   [Channel Journals (if A=1, one per active channel)]
-///     Chapter V header: 3 bytes
-///       Byte 0: S|CHAN[3:0]|H|LEN_HI[1:0]   S=1 on last channel journal
-///       Byte 1: LEN_LO[7:0]
-///       Byte 2: P|C|M|W|N|Q|T|A  chapter presence flags
-///     Chapters in order: P, C, M, W, N, Q, T, A
+///     Channel Journal Header: 3 bytes (RFC 6295 §5 Figure 9)
+///       Byte 0: S|CHAN[3:0]|H|LENGTH_HI[1:0]   S=1 on last channel journal
+///       Byte 1: LENGTH_LO[7:0]
+///       Byte 2: P|C|M|W|N|E|T|A  chapter presence (TOC) flags
+///     LENGTH is 10 bits and codes the *total* channel-journal byte count,
+///     **including** this 3-byte header (RFC 6295 §A.1 "LENGTH field").
+///     Chapters in RFC bit-order: P, C, M, W, N, (E), T, A
+///     Chapter E (Note Command Extras) is not currently emitted by this
+///     library; the bit position is left reserved.
 /// </summary>
 internal static class RtpMidiJournal
 {
@@ -47,15 +51,17 @@ internal static class RtpMidiJournal
     private const byte ChapterXLastChapterBit = 0x80;
     private const byte ChapterXCompleteBit    = 0x40;
 
-    // Chapter V (§A.1) presence byte bit positions
-    private const byte ChapVFlagP = 0x80; // Program Change
-    private const byte ChapVFlagC = 0x40; // Control Change
-    private const byte ChapVFlagM = 0x20; // Parameter System (RPN/NRPN)
-    private const byte ChapVFlagW = 0x10; // Pitch Wheel
-    private const byte ChapVFlagN = 0x08; // Note Off
-    private const byte ChapVFlagQ = 0x04; // Note On
-    private const byte ChapVFlagT = 0x02; // Channel Pressure
-    private const byte ChapVFlagA = 0x01; // Poly Key Pressure
+    // Channel journal TOC byte bit positions, per RFC 6295 §5 Figure 9.
+    // Chapter N encodes BOTH NoteOn and NoteOff events (§A.6). Chapter E
+    // (Note Command Extras, §A.7) is reserved but not currently emitted.
+    private const byte ChapTocP = 0x80; // §A.2 Program Change
+    private const byte ChapTocC = 0x40; // §A.3 Control Change
+    private const byte ChapTocM = 0x20; // §A.4 Parameter System (RPN/NRPN)
+    private const byte ChapTocW = 0x10; // §A.5 Pitch Wheel
+    private const byte ChapTocN = 0x08; // §A.6 Note (On + Off)
+    private const byte ChapTocE = 0x04; // §A.7 Note Command Extras (reserved)
+    private const byte ChapTocT = 0x02; // §A.8 Channel Aftertouch
+    private const byte ChapTocA = 0x01; // §A.9 Poly Key Pressure
 
     // -------------------------------------------------------------------------
     // Legacy API — Chapter X only (unchanged, existing callers still work)
@@ -334,74 +340,79 @@ internal static class RtpMidiJournal
         {
             for (int ci = 0; ci < totalChan; ci++)
             {
-                // Chapter V header (3 bytes)
+                // Channel journal header (3 bytes, RFC 6295 §5 Figure 9).
                 if (data.Length < pos + 3) return false;
 
                 byte vb0  = data[pos];
                 byte vb1  = data[pos + 1];
                 byte vb2  = data[pos + 2];
-                pos += 3;
 
                 byte channel = (byte)((vb0 >> 3) & 0x0F);
-                int  chapLen = ((vb0 & 0x03) << 8) | vb1;
+                // LENGTH is the *total* length including the 3-byte header.
+                int totalLen = ((vb0 & 0x03) << 8) | vb1;
+                if (totalLen < 3) return false;
+                if (data.Length < pos + totalLen) return false;
 
-                if (data.Length < pos + chapLen) return false;
-
-                var chapData = data.Slice(pos, chapLen);
-                pos += chapLen;
+                // Chapter data follows the 3-byte header.
+                int chapLen = totalLen - 3;
+                var chapData = data.Slice(pos + 3, chapLen);
+                pos += totalLen;
 
                 int cpos = 0;
 
-                if ((vb2 & ChapVFlagP) != 0)
+                if ((vb2 & ChapTocP) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterP(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
                     cpos += n;
                 }
 
-                if ((vb2 & ChapVFlagC) != 0)
+                if ((vb2 & ChapTocC) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterC(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
                     cpos += n;
                 }
 
-                if ((vb2 & ChapVFlagM) != 0)
+                if ((vb2 & ChapTocM) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterM(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
                     cpos += n;
                 }
 
-                if ((vb2 & ChapVFlagW) != 0)
+                if ((vb2 & ChapTocW) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterW(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
                     cpos += n;
                 }
 
-                if ((vb2 & ChapVFlagN) != 0)
+                if ((vb2 & ChapTocN) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterN(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
                     cpos += n;
                 }
 
-                if ((vb2 & ChapVFlagQ) != 0)
+                // Chapter E (§A.7) is not emitted by this library and not
+                // decoded for recovery. If a remote sets the E bit we simply
+                // skip over the remaining bytes in this channel journal -- the
+                // LENGTH field has already advanced `pos` past everything, so
+                // we just stop chapter dispatching early.
+                if ((vb2 & ChapTocE) != 0)
                 {
-                    int n = ChannelMidiState.DecodeChapterQ(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
+                    break;
                 }
 
-                if ((vb2 & ChapVFlagT) != 0)
+                if ((vb2 & ChapTocT) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterT(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
                     cpos += n;
                 }
 
-                if ((vb2 & ChapVFlagA) != 0)
+                if ((vb2 & ChapTocA) != 0)
                 {
                     int n = ChannelMidiState.DecodeChapterA(chapData[cpos..], channel, recovered);
                     if (n < 0) break;
@@ -466,19 +477,20 @@ internal static class RtpMidiJournal
     /// </summary>
     private static byte[] BuildChannelJournal(byte channel, ChannelMidiState state, bool isLastChannel)
     {
-        // Determine which chapters are present and encode them
+        // Determine which chapters are present and encode them. Chapter N now
+        // carries both NoteOn and NoteOff per RFC 6295 §A.6 (the old separate
+        // Chapter Q for NoteOn is not part of the RFC and has been removed).
         bool hasP = state.HasProgram;
         bool hasC = state.HasControlChange;
         bool hasM = state.HasParameterSystem;
         bool hasW = state.HasPitchWheel;
-        bool hasN = state.HasNoteOff;
-        bool hasQ = state.HasNoteOn;
+        bool hasN = state.HasNotes;
         bool hasT = state.HasChannelPressure;
         bool hasA = state.HasPolyPressure;
 
-        // Encode each chapter, noting which is the last (sets its S flag)
-        // Chapter order: P, C, M, W, N, Q, T, A
-        bool[] present = [hasP, hasC, hasM, hasW, hasN, hasQ, hasT, hasA];
+        // Chapter order in the wire format (P, C, M, W, N, E, T, A) matches
+        // the TOC bit order. E is reserved; we never emit it.
+        bool[] present = [hasP, hasC, hasM, hasW, hasN, hasT, hasA];
         int lastIdx = -1;
         for (int i = present.Length - 1; i >= 0; i--) { if (present[i]) { lastIdx = i; break; } }
 
@@ -487,42 +499,42 @@ internal static class RtpMidiJournal
         byte[]? mBytes = hasM ? state.EncodeChapterM(isLast: lastIdx == 2) : null;
         byte[]? wBytes = hasW ? state.EncodeChapterW(isLast: lastIdx == 3) : null;
         byte[]? nBytes = hasN ? state.EncodeChapterN(isLast: lastIdx == 4) : null;
-        byte[]? qBytes = hasQ ? state.EncodeChapterQ(isLast: lastIdx == 5) : null;
-        byte[]? tBytes = hasT ? state.EncodeChapterT(isLast: lastIdx == 6) : null;
-        byte[]? aBytes = hasA ? state.EncodeChapterA(isLast: lastIdx == 7) : null;
+        byte[]? tBytes = hasT ? state.EncodeChapterT(isLast: lastIdx == 5) : null;
+        byte[]? aBytes = hasA ? state.EncodeChapterA(isLast: lastIdx == 6) : null;
 
-        // Total chapter payload length (excluding the 3-byte Chapter V header)
+        // Chapter payload size (header is 3 bytes, added below).
         int chapLen = 0;
         if (pBytes != null) chapLen += pBytes.Length;
         if (cBytes != null) chapLen += cBytes.Length;
         if (mBytes != null) chapLen += mBytes.Length;
         if (wBytes != null) chapLen += wBytes.Length;
         if (nBytes != null) chapLen += nBytes.Length;
-        if (qBytes != null) chapLen += qBytes.Length;
         if (tBytes != null) chapLen += tBytes.Length;
         if (aBytes != null) chapLen += aBytes.Length;
 
-        // Chapter V presence flags
+        // TOC presence flags (byte 2 of the channel journal header).
         byte presence = 0;
-        if (hasP) presence |= ChapVFlagP;
-        if (hasC) presence |= ChapVFlagC;
-        if (hasM) presence |= ChapVFlagM;
-        if (hasW) presence |= ChapVFlagW;
-        if (hasN) presence |= ChapVFlagN;
-        if (hasQ) presence |= ChapVFlagQ;
-        if (hasT) presence |= ChapVFlagT;
-        if (hasA) presence |= ChapVFlagA;
+        if (hasP) presence |= ChapTocP;
+        if (hasC) presence |= ChapTocC;
+        if (hasM) presence |= ChapTocM;
+        if (hasW) presence |= ChapTocW;
+        if (hasN) presence |= ChapTocN;
+        if (hasT) presence |= ChapTocT;
+        if (hasA) presence |= ChapTocA;
 
-        // Chapter V header (3 bytes):
-        //   Byte 0: S | CHAN[3:0] | H(=0) | LEN[9:8]
-        //   Byte 1: LEN[7:0]
-        //   Byte 2: presence flags
-        var journal = new byte[3 + chapLen];
+        // Channel journal header (3 bytes, RFC 6295 §5 Figure 9):
+        //   Byte 0: S | CHAN[3:0] | H(=0) | LENGTH[9:8]
+        //   Byte 1: LENGTH[7:0]
+        //   Byte 2: TOC (P|C|M|W|N|E|T|A)
+        // LENGTH is the **total** journal byte count *including* the 3-byte
+        // header (RFC 6295 §A.1 "LENGTH field" definition).
+        int totalLen = 3 + chapLen;
+        var journal = new byte[totalLen];
         journal[0] = (byte)(
             (isLastChannel ? 0x80 : 0) |
             ((channel & 0x0F) << 3) |
-            ((chapLen >> 8) & 0x03));
-        journal[1] = (byte)(chapLen & 0xFF);
+            ((totalLen >> 8) & 0x03));
+        journal[1] = (byte)(totalLen & 0xFF);
         journal[2] = presence;
 
         int off = 3;
@@ -531,7 +543,6 @@ internal static class RtpMidiJournal
         if (mBytes != null) { mBytes.CopyTo(journal, off); off += mBytes.Length; }
         if (wBytes != null) { wBytes.CopyTo(journal, off); off += wBytes.Length; }
         if (nBytes != null) { nBytes.CopyTo(journal, off); off += nBytes.Length; }
-        if (qBytes != null) { qBytes.CopyTo(journal, off); off += qBytes.Length; }
         if (tBytes != null) { tBytes.CopyTo(journal, off); off += tBytes.Length; }
         if (aBytes != null) { aBytes.CopyTo(journal, off); }
 

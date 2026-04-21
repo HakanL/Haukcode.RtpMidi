@@ -412,26 +412,17 @@ internal sealed class ChannelMidiState
     public byte[] EncodeChapterC(bool isLast)
     {
         // Collect active controllers (up to 128 — 7-bit LEN field codes count-1)
-        var entries = new List<(byte cc, byte val)>(128);
-        for (int i = 0; i < 128 && entries.Count < 128; i++)
+        Span<(byte cc, byte val)> entries = stackalloc (byte, byte)[128];
+        int count = 0;
+        for (int i = 0; i < 128; i++)
         {
             if (ccActive[i])
-                entries.Add(((byte)i, ccValues[i]));
+                entries[count++] = ((byte)i, ccValues[i]);
         }
 
-        int count = entries.Count;
-        var buf = new byte[1 + count * 2];
-        buf[0] = (byte)((isLast ? 0x80 : 0) | ((count - 1) & 0x7F));
-
-        for (int i = 0; i < count; i++)
-        {
-            bool lastEntry = i == count - 1;
-            buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].cc  & 0x7F));
-            // A = 0 (value tool): bit 7 clear, value in bits 0-6
-            buf[1 + i * 2 + 1] = (byte)(entries[i].val & 0x7F);
-        }
-
-        return buf;
+        // A = 0 (value tool): bit 7 of byte1 clear for all emitted entries.
+        return Journal.ChapterListEncoder.EncodeCountMinusOneList(
+            isLast, entries.Slice(0, count), secondByteFlagMask: 0x00);
     }
 
     /// <summary>
@@ -587,26 +578,17 @@ internal sealed class ChannelMidiState
     /// </summary>
     public byte[] EncodeChapterA(bool isLast)
     {
-        var entries = new List<(byte note, byte pressure)>(128);
-        for (int i = 0; i < 128 && entries.Count < 128; i++)
+        Span<(byte note, byte pressure)> entries = stackalloc (byte, byte)[128];
+        int count = 0;
+        for (int i = 0; i < 128; i++)
         {
             if (polyPressureActive[i])
-                entries.Add(((byte)i, polyPressure[i]));
+                entries[count++] = ((byte)i, polyPressure[i]);
         }
 
-        int count = entries.Count;
-        var buf = new byte[1 + count * 2];
-        buf[0] = (byte)((isLast ? 0x80 : 0) | ((count - 1) & 0x7F));
-
-        for (int i = 0; i < count; i++)
-        {
-            bool lastEntry = i == count - 1;
-            buf[1 + i * 2]     = (byte)((lastEntry ? 0x80 : 0) | (entries[i].note & 0x7F));
-            // X = 0 (not before All-Notes-Off); pressure in low 7 bits.
-            buf[1 + i * 2 + 1] = (byte)(entries[i].pressure & 0x7F);
-        }
-
-        return buf;
+        // X = 0 (not before All-Notes-Off): bit 7 of byte1 clear for all entries.
+        return Journal.ChapterListEncoder.EncodeCountMinusOneList(
+            isLast, entries.Slice(0, count), secondByteFlagMask: 0x00);
     }
 
     /// <summary>

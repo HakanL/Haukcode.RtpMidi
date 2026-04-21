@@ -51,16 +51,6 @@ internal static class RtpMidiJournal
     // Keep the old name for backward-compat with existing tests
     private const byte SystemJournalHeaderXOnly = SysJournalFlagX;
 
-    // Channel journal TOC byte bit positions, per RFC 6295 §5 Figure 9.
-    private const byte ChapTocP = RfcChapterRegistry.TocP;
-    private const byte ChapTocC = RfcChapterRegistry.TocC;
-    private const byte ChapTocM = RfcChapterRegistry.TocM;
-    private const byte ChapTocW = RfcChapterRegistry.TocW;
-    private const byte ChapTocN = RfcChapterRegistry.TocN;
-    private const byte ChapTocE = RfcChapterRegistry.TocE;
-    private const byte ChapTocT = RfcChapterRegistry.TocT;
-    private const byte ChapTocA = RfcChapterRegistry.TocA;
-
     // -------------------------------------------------------------------------
     // Legacy API — Chapter X only (unchanged, existing callers still work)
     // -------------------------------------------------------------------------
@@ -344,68 +334,11 @@ internal static class RtpMidiJournal
                 var chapData = data.Slice(pos + 3, chapLen);
                 pos += totalLen;
 
-                int cpos = 0;
-
-                if ((vb2 & ChapTocP) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterP(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
-                }
-
-                if ((vb2 & ChapTocC) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterC(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
-                }
-
-                if ((vb2 & ChapTocM) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterM(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
-                }
-
-                if ((vb2 & ChapTocW) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterW(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
-                }
-
-                if ((vb2 & ChapTocN) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterN(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
-                }
-
-                // Chapter E (§A.7) is not emitted by this library and not
-                // decoded for recovery. If a remote sets the E bit we skip the
-                // remaining chapters of THIS channel journal (T and A cannot be
-                // safely parsed without knowing Chapter E's size) but MUST
-                // continue processing subsequent channel journals — `pos` has
-                // already been advanced by `totalLen` so the next ci iteration
-                // starts at the correct offset.  A `break` here would silently
-                // drop all remaining channel journals, which is a correctness bug.
-                if ((vb2 & ChapTocE) != 0)
-                {
-                    continue;
-                }
-
-                if ((vb2 & ChapTocT) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterT(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                    cpos += n;
-                }
-
-                if ((vb2 & ChapTocA) != 0)
-                {
-                    int n = ChannelMidiState.DecodeChapterA(chapData[cpos..], channel, recovered);
-                    if (n < 0) break;
-                }
+                // Dispatch all present chapters in TOC order. If the reserved
+                // Chapter E bit is set, DecodeChapters stops processing THIS
+                // channel's chapters but we MUST continue to the next channel
+                // journal (pos has already been advanced by totalLen above).
+                ChannelJournalCoordinator.DecodeChapters(chapData, vb2, channel, recovered);
             }
         }
 
@@ -457,61 +390,36 @@ internal static class RtpMidiJournal
     }
 
     /// <summary>
-    /// Builds a single channel journal (Chapter V header + all active chapters).
+    /// Builds a single channel journal (3-byte header + active chapter bodies).
+    /// Dispatches through <see cref="ChannelJournalCoordinator"/> so that the
+    /// chapter-order, TOC bits, and last-chapter S bit are driven by the
+    /// codec list rather than hand-unrolled per chapter.
     /// </summary>
     private static byte[] BuildChannelJournal(byte channel, ChannelMidiState state, bool isLastChannel)
     {
-        // Determine which chapters are present and encode them. Chapter N now
-        // carries both NoteOn and NoteOff per RFC 6295 §A.6 (the old separate
-        // Chapter Q for NoteOn is not part of the RFC and has been removed).
-        bool hasP = state.HasProgram;
-        bool hasC = state.HasControlChange;
-        bool hasM = state.HasParameterSystem;
-        bool hasW = state.HasPitchWheel;
-        bool hasN = state.HasNotes;
-        bool hasT = state.HasChannelPressure;
-        bool hasA = state.HasPolyPressure;
+        var coord   = new ChannelJournalCoordinator(state);
+        var present = new List<IChapterCodec>(7);
+        foreach (var codec in coord.Chapters)
+            if (codec.HasData) present.Add(codec);
 
-        // Chapter order in the wire format (P, C, M, W, N, E, T, A) matches
-        // the TOC bit order. E is reserved; we never emit it.
-        bool[] present = [hasP, hasC, hasM, hasW, hasN, hasT, hasA];
-        int lastIdx = -1;
-        for (int i = present.Length - 1; i >= 0; i--) { if (present[i]) { lastIdx = i; break; } }
+        int      count    = present.Count;
+        byte[][] bodies   = new byte[count][];
+        int      chapLen  = 0;
+        byte     presence = 0;
 
-        byte[]? pBytes = hasP ? state.EncodeChapterP(isLast: lastIdx == 0) : null;
-        byte[]? cBytes = hasC ? state.EncodeChapterC(isLast: lastIdx == 1) : null;
-        byte[]? mBytes = hasM ? state.EncodeChapterM(isLast: lastIdx == 2) : null;
-        byte[]? wBytes = hasW ? state.EncodeChapterW(isLast: lastIdx == 3) : null;
-        byte[]? nBytes = hasN ? state.EncodeChapterN(isLast: lastIdx == 4) : null;
-        byte[]? tBytes = hasT ? state.EncodeChapterT(isLast: lastIdx == 5) : null;
-        byte[]? aBytes = hasA ? state.EncodeChapterA(isLast: lastIdx == 6) : null;
+        for (int i = 0; i < count; i++)
+        {
+            bool isLastChapter = i == count - 1;
+            bodies[i] = present[i].Encode(isLastChapter);
+            chapLen  += bodies[i].Length;
+            presence |= RfcChapterRegistry.All[present[i].ChapterId].TocBit;
+        }
 
-        // Chapter payload size (header is 3 bytes, added below).
-        int chapLen = 0;
-        if (pBytes != null) chapLen += pBytes.Length;
-        if (cBytes != null) chapLen += cBytes.Length;
-        if (mBytes != null) chapLen += mBytes.Length;
-        if (wBytes != null) chapLen += wBytes.Length;
-        if (nBytes != null) chapLen += nBytes.Length;
-        if (tBytes != null) chapLen += tBytes.Length;
-        if (aBytes != null) chapLen += aBytes.Length;
-
-        // TOC presence flags (byte 2 of the channel journal header).
-        byte presence = 0;
-        if (hasP) presence |= ChapTocP;
-        if (hasC) presence |= ChapTocC;
-        if (hasM) presence |= ChapTocM;
-        if (hasW) presence |= ChapTocW;
-        if (hasN) presence |= ChapTocN;
-        if (hasT) presence |= ChapTocT;
-        if (hasA) presence |= ChapTocA;
-
-        // Channel journal header (3 bytes, RFC 6295 §5 Figure 9):
+        // Channel journal header (3 bytes, §5 Figure 9):
         //   Byte 0: S | CHAN[3:0] | H(=0) | LENGTH[9:8]
         //   Byte 1: LENGTH[7:0]
         //   Byte 2: TOC (P|C|M|W|N|E|T|A)
-        // LENGTH is the **total** journal byte count *including* the 3-byte
-        // header (RFC 6295 §A.1 "LENGTH field" definition).
+        // LENGTH is the total byte count including the 3-byte header (§A.1).
         int totalLen = 3 + chapLen;
         var journal = new byte[totalLen];
         journal[0] = (byte)(
@@ -522,13 +430,11 @@ internal static class RtpMidiJournal
         journal[2] = presence;
 
         int off = 3;
-        if (pBytes != null) { pBytes.CopyTo(journal, off); off += pBytes.Length; }
-        if (cBytes != null) { cBytes.CopyTo(journal, off); off += cBytes.Length; }
-        if (mBytes != null) { mBytes.CopyTo(journal, off); off += mBytes.Length; }
-        if (wBytes != null) { wBytes.CopyTo(journal, off); off += wBytes.Length; }
-        if (nBytes != null) { nBytes.CopyTo(journal, off); off += nBytes.Length; }
-        if (tBytes != null) { tBytes.CopyTo(journal, off); off += tBytes.Length; }
-        if (aBytes != null) { aBytes.CopyTo(journal, off); }
+        for (int i = 0; i < count; i++)
+        {
+            bodies[i].CopyTo(journal, off);
+            off += bodies[i].Length;
+        }
 
         return journal;
     }

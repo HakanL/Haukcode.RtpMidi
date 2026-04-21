@@ -15,7 +15,7 @@ Enables bidirectional MIDI over IP — receive notes, CC, program changes, and s
 - Both **initiator** and **responder** roles, with optional auto-reconnect
 - Clock sync (3-way CK exchange) — required by hardware bridges
 - RTP-MIDI packet encoding/decoding (RFC 6295)
-- Full RFC 6295 recovery journal — system chapters X (SysEx) and F (System Common), plus all channel chapters (Program Change, Control Change, Pitch Wheel, Note On/Off, Channel Pressure, Poly Key Pressure, RPN/NRPN Parameter System)
+- RFC 6295 recovery journal — system chapters X (SysEx) and F (System Common), plus channel chapters P/C/W/M/N/T/A (Program Change, Control Change, Pitch Wheel, RPN/NRPN, Note On/Off, Channel Pressure, Poly Key Pressure)
 - `IObservable<T>` streams via **System.Reactive** for received MIDI and state changes
 - Cross-platform: Windows, Linux (including ARM64), macOS
 - Zero platform-specific code — pure managed C#
@@ -143,24 +143,30 @@ The clock sync exchange (CK0 → CK1 → CK2) is **mandatory** — hardware brid
 
 ### Recovery Journal (RFC 6295 §5 / §A)
 
-The library implements the full RFC 6295 recovery journal on both the send and receive sides.
+The library implements the RFC 6295 recovery journal on both the send and receive sides.
 
-**Covered chapters:**
+**Implemented chapters:**
 
-| Scope | Chapter | Content |
-|-------|---------|---------|
-| System | X | System Exclusive (SysEx) |
-| System | F | System Common messages |
-| Channel | P | Program Change + Bank Select |
-| Channel | C | Control Change (all 128 controllers) |
-| Channel | W | Pitch Wheel |
-| Channel | M | RPN/NRPN Parameter System |
-| Channel | N | Note Off |
-| Channel | Q | Note On |
-| Channel | T | Channel Pressure |
-| Channel | A | Poly Key Pressure |
+| Scope | Chapter | Content | Notes |
+|-------|---------|---------|-------|
+| System | X | System Exclusive (SysEx) | Last complete SysEx retained until RS confirms receipt |
+| System | F | System Common (MTC, Song Position, Song Select) | |
+| Channel | P | Program Change + Bank Select (CC 0 / CC 32) | |
+| Channel | C | Control Change (all 128 controllers) | |
+| Channel | W | Pitch Wheel | |
+| Channel | M | RPN/NRPN Parameter System | Full log list (most-recently-selected first, §A.4) |
+| Channel | N | Note On + Note Off (unified, §A.6) | Note log list + OFFBITS bitfield |
+| Channel | T | Channel Pressure | |
+| Channel | A | Poly Key Pressure | |
 
-On the send side, each outgoing packet carries a journal encoding the most-recent state for every active channel and any buffered SysEx, so a receiver who missed a packet can reconstruct the lost events from the next packet it receives.
+**Out of scope / not implemented:**
+
+| Chapter | Reason |
+|---------|--------|
+| E (Tone Map) | Encodes the duration between Note On and its matching Note Off, which is unknown at Note On send time. Implementing Chapter E would require buffering all outgoing Note Ons and only sending the journal after the corresponding Note Off arrives — incompatible with a real-time streaming API. Inbound Chapter E journals are detected and skipped safely. |
+| Q (Note Off) | RFC 6295 defines only Chapter N (unified Note On/Off). Chapter Q was an informal pre-standard extension; it is not part of the specification and is not emitted or expected. |
+
+On the send side, each outgoing packet carries a journal encoding the most-recent state for every active channel and any buffered SysEx. The journal checkpoint advances when the remote peer sends an RS (Receiver Feedback) packet confirming receipt, at which point accumulated state is cleared so the journal does not grow indefinitely.
 
 On the receive side, sequence numbers are tracked; when a gap is detected the incoming packet's journal is consulted and any recovered events are emitted to `MidiReceived` subscribers before the current packet's MIDI data.
 
@@ -170,6 +176,20 @@ On the receive side, sequence numbers are tracked; when a gap is detected the in
 // Enabled by default; disable only on strictly loss-free paths
 session.EnableRecoveryJournal = false;
 ```
+
+### MIDI command section (RFC 6295 §3)
+
+| Feature | Status |
+|---------|--------|
+| Short header (4-bit length) | Implemented |
+| Long header (12-bit length) | Implemented |
+| Z flag: VLQ delta-times | Implemented (encode + decode) |
+| J flag: recovery journal present | Implemented |
+| P flag (phantom / cross-packet running status) — **receive** | Implemented — incoming P-flagged packets from peers (Apple CoreMIDI, hardware bridges) are correctly expanded using the running status from the previous packet |
+| P flag (phantom status) — **send** | Not implemented — the library always includes the full status byte on every packet, which is correct and universally compatible. The send-side omission saves at most 1 byte per packet when consecutive messages share a status byte, which is negligible for typical use. |
+| Within-packet running status — **receive** | Implemented via `DecodeCommands` |
+| Within-packet running status — **send** | Not implemented — each `SendMidiAsync` call produces one MIDI message per packet, so within-packet RS compression has no opportunity to apply. |
+| SysEx fragmentation (§3.3) | Implemented — large SysEx is split into ≤128-byte segments with F0/F7 continuation markers; fragments are reassembled on the receive side. |
 
 ---
 

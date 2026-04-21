@@ -319,22 +319,74 @@ public class ChannelJournalTests
     public void ChapterM_DataEntryResetOnNewParamSelect()
     {
         var state = new ChannelMidiState();
-        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB
-        state.ProcessMidi([0xB0, 100, 0]);
-        state.ProcessMidi([0xB0, 6, 12]);   // Data Entry MSB
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB=0
+        state.ProcessMidi([0xB0, 100, 0]);  // RPN LSB=0
+        state.ProcessMidi([0xB0, 6, 12]);   // Data Entry MSB=12
 
-        // Now select a new parameter — data entry should reset
-        state.ProcessMidi([0xB0, 101, 1]);  // New RPN MSB
-        state.ProcessMidi([0xB0, 100, 0]);
+        // Select a different parameter — data resets for the NEW entry,
+        // but the old entry (RPN 0,0 with CC6=12) is retained in the log.
+        state.ProcessMidi([0xB0, 101, 1]);  // New RPN MSB=1
+        state.ProcessMidi([0xB0, 100, 0]);  // New RPN LSB=0
 
+        // Log (most-recent first): [(1,0) no data, (0,0) CC6=12]
+        // Encoding: 2 header + 3 (item0) + 4 (item1 with J) = 9 bytes
         var bytes = state.EncodeChapterM(isLast: true);
-        // No data entry for the new parameter: 2-byte header + PNUM_LSB + PNUM_MSB + flags = 5 bytes
-        Assert.Equal(5, bytes.Length);
+        Assert.Equal(9, bytes.Length);
 
         var recovered = new List<byte[]>();
         ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
-        // Only param select CCs, no CC6
-        Assert.Equal(2, recovered.Count);
+        // New param: CC101(1) + CC100(0); old param: CC101(0) + CC100(0) + CC6(12)
+        Assert.Equal(5, recovered.Count);
+        Assert.Equal(new byte[] { 0xB0, 101, 1 }, recovered[0]); // new param select
+        Assert.Equal(new byte[] { 0xB0, 100, 0 }, recovered[1]);
+        Assert.Equal(new byte[] { 0xB0, 101, 0 }, recovered[2]); // old param select
+        Assert.Equal(new byte[] { 0xB0, 100, 0 }, recovered[3]);
+        Assert.Equal(new byte[] { 0xB0, 6,   12 }, recovered[4]); // old data entry
+    }
+
+    [Fact]
+    public void ChapterM_PendingMsb_EncodedInHeader()
+    {
+        var state = new ChannelMidiState();
+        // Only MSB sent, LSB not yet received — pending state
+        state.ProcessMidi([0xB0, 101, 3]); // RPN MSB=3, no LSB yet
+
+        Assert.True(state.HasParameterSystem);
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        // Header (2 bytes, P=1) + pending byte (1 byte) + no log items = 3 bytes
+        Assert.Equal(3, bytes.Length);
+        // P bit = 0x4000 → byte[0] bit 6 set
+        Assert.NotEqual(0, bytes[0] & 0x40);
+        // Pending byte: Q=0 (RPN), MSB=3
+        Assert.Equal(3, bytes[2] & 0x7F);
+        Assert.Equal(0, bytes[2] & 0x80); // Q=0 (RPN)
+    }
+
+    [Fact]
+    public void ChapterM_MultiParam_BothEntriesRecovered()
+    {
+        var state = new ChannelMidiState();
+        // Select and set two different RPN parameters
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB=0
+        state.ProcessMidi([0xB0, 100, 0]);  // Pitch Bend Sensitivity
+        state.ProcessMidi([0xB0, 6,   2]);  // 2 semitones
+
+        state.ProcessMidi([0xB0, 101, 0]);  // RPN MSB=0
+        state.ProcessMidi([0xB0, 100, 1]);  // Channel Fine Tuning
+        state.ProcessMidi([0xB0, 6,  64]);  // fine tuning value
+
+        var bytes = state.EncodeChapterM(isLast: true);
+        var recovered = new List<byte[]>();
+        int consumed = ChannelMidiState.DecodeChapterM(bytes, 0, recovered);
+        Assert.Equal(bytes.Length, consumed);
+
+        // Most-recent first: Param(0,1) CC6=64, then Param(0,0) CC6=2
+        Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0xB0, 101, 0 }));
+        Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0xB0, 100, 1 }));
+        Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0xB0, 6,  64 }));
+        Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0xB0, 100, 0 }));
+        Assert.Contains(recovered, m => m.SequenceEqual(new byte[] { 0xB0, 6,   2 }));
     }
 
     [Fact]

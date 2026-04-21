@@ -122,17 +122,30 @@ internal sealed class ChannelMidiState
     // -----------------------------------------------------------------------
     // Chapter M — Parameter System (RPN/NRPN)
     // -----------------------------------------------------------------------
+    //
+    // RFC 6295 §A.4 requires a full log list of parameter entries, most-recently-
+    // selected first. Each entry carries the parameter number and the most-recent
+    // data-entry values (CC6/CC38). A second selection of the same parameter number
+    // moves the entry to the front with cleared data (re-selection semantics).
 
-    private bool isNrpn;
-    private byte paramMsb;
-    private byte paramLsb;
-    private bool hasDataEntryMsb;
-    private bool hasDataEntryLsb;
-    private byte dataEntryMsb;
-    private byte dataEntryLsb;
+    private struct ParamEntry
+    {
+        public bool IsNrpn;
+        public byte ParamMsb, ParamLsb;
+        public bool HasDataMsb, HasDataLsb;
+        public byte DataMsb, DataLsb;
+    }
+
+    /// <summary>Log of selected parameters, most-recently-selected first (RFC 6295 §A.4).</summary>
+    private readonly List<ParamEntry> paramLog = new();
+
+    /// <summary>True when a parameter-number MSB CC was received but the LSB has not yet arrived.</summary>
+    private bool hasPendingParamMsb;
+    private bool pendingIsNrpn;
+    private byte pendingParamMsb;
 
     /// <summary>True when RPN/NRPN parameter-system state has been accumulated on this channel.</summary>
-    public bool HasParameterSystem { get; private set; }
+    public bool HasParameterSystem => paramLog.Count > 0 || hasPendingParamMsb;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -171,14 +184,10 @@ internal sealed class ChannelMidiState
         HasPolyPressure  = false;
         Array.Clear(polyPressure,       0, polyPressure.Length);
         Array.Clear(polyPressureActive, 0, polyPressureActive.Length);
-        HasParameterSystem = false;
-        isNrpn           = false;
-        paramMsb         = 0;
-        paramLsb         = 0;
-        hasDataEntryMsb  = false;
-        hasDataEntryLsb  = false;
-        dataEntryMsb     = 0;
-        dataEntryLsb     = 0;
+        paramLog.Clear();
+        hasPendingParamMsb = false;
+        pendingIsNrpn      = false;
+        pendingParamMsb    = 0;
     }
 
     // -----------------------------------------------------------------------
@@ -255,27 +264,47 @@ internal sealed class ChannelMidiState
                     // Parameter system tracking (Chapter M)
                     switch (cc)
                     {
-                        case 99:  // NRPN MSB — start NRPN selection, reset data-entry
-                            isNrpn = true; paramMsb = val;
-                            hasDataEntryMsb = false; hasDataEntryLsb = false;
-                            HasParameterSystem = true;
+                        case 99:  // NRPN MSB — begin NRPN parameter selection
+                            hasPendingParamMsb = true;
+                            pendingIsNrpn      = true;
+                            pendingParamMsb    = val;
                             break;
-                        case 101: // RPN MSB — start RPN selection, reset data-entry
-                            isNrpn = false; paramMsb = val;
-                            hasDataEntryMsb = false; hasDataEntryLsb = false;
-                            HasParameterSystem = true;
+                        case 101: // RPN MSB — begin RPN parameter selection
+                            hasPendingParamMsb = true;
+                            pendingIsNrpn      = false;
+                            pendingParamMsb    = val;
                             break;
-                        case 98:  // NRPN LSB
-                            if (isNrpn) { paramLsb = val; }
+                        case 98:  // NRPN LSB — complete NRPN selection
+                            if (hasPendingParamMsb && pendingIsNrpn)
+                            {
+                                FinalizeParamSelection(pendingIsNrpn, pendingParamMsb, val);
+                                hasPendingParamMsb = false;
+                            }
                             break;
-                        case 100: // RPN LSB
-                            if (!isNrpn) { paramLsb = val; }
+                        case 100: // RPN LSB — complete RPN selection
+                            if (hasPendingParamMsb && !pendingIsNrpn)
+                            {
+                                FinalizeParamSelection(pendingIsNrpn, pendingParamMsb, val);
+                                hasPendingParamMsb = false;
+                            }
                             break;
-                        case 6:   // Data Entry MSB
-                            if (HasParameterSystem) { dataEntryMsb = val; hasDataEntryMsb = true; }
+                        case 6:   // Data Entry MSB — update front log entry
+                            if (paramLog.Count > 0)
+                            {
+                                var e = paramLog[0];
+                                e.HasDataMsb = true;
+                                e.DataMsb    = val;
+                                paramLog[0]  = e;
+                            }
                             break;
-                        case 38:  // Data Entry LSB
-                            if (HasParameterSystem) { dataEntryLsb = val; hasDataEntryLsb = true; }
+                        case 38:  // Data Entry LSB — update front log entry
+                            if (paramLog.Count > 0)
+                            {
+                                var e = paramLog[0];
+                                e.HasDataLsb = true;
+                                e.DataLsb    = val;
+                                paramLog[0]  = e;
+                            }
                             break;
                     }
                 }
@@ -320,6 +349,26 @@ internal sealed class ChannelMidiState
         }
         HasNoteOn  = anyOn;
         HasNoteOff = anyOff;
+    }
+
+    /// <summary>
+    /// Completes parameter selection: removes any existing entry for the same
+    /// (isNrpn, msb, lsb) address then inserts a fresh entry at the front of
+    /// <see cref="paramLog"/> with cleared data-entry fields. Data resets on
+    /// re-selection per RFC 6295 §A.4.
+    /// </summary>
+    private void FinalizeParamSelection(bool isNrpn, byte msb, byte lsb)
+    {
+        for (int i = 0; i < paramLog.Count; i++)
+        {
+            var e = paramLog[i];
+            if (e.IsNrpn == isNrpn && e.ParamMsb == msb && e.ParamLsb == lsb)
+            {
+                paramLog.RemoveAt(i);
+                break;
+            }
+        }
+        paramLog.Insert(0, new ParamEntry { IsNrpn = isNrpn, ParamMsb = msb, ParamLsb = lsb });
     }
 
     // -----------------------------------------------------------------------
@@ -563,56 +612,63 @@ internal sealed class ChannelMidiState
     /// <summary>
     /// Encodes Chapter M (Parameter System: RPN/NRPN) — RFC 6295 §A.4.
     ///
-    /// Wire layout (retained from prior implementation; see §A.4 for full spec):
-    ///   2-byte header (big-endian 16-bit) with S / P / E / U / W / Z flags and
-    ///   10-bit total-chapter-length field. Followed by one log item:
-    ///     PNUM_LSB byte, PNUM_MSB byte (Q flag for NRPN), flags byte,
-    ///     then optional data-entry MSB / LSB bytes.
+    /// Wire layout:
+    ///   2-byte header: S(last) | P(pending MSB) | E(0) | U(all-RPN) | W(all-NRPN) | Z(0) |
+    ///                  10-bit total chapter length
+    ///   Optional pending byte (when P=1): Q(NRPN) | PNUM_MSB[6:0]
+    ///   Log items (most-recent-selected first), each:
+    ///     PNUM_LSB byte: S(last item) | PNUM_LSB[6:0]
+    ///     PNUM_MSB byte: Q(NRPN)     | PNUM_MSB[6:0]
+    ///     flags byte:    J(data MSB) | K(data LSB) | …
+    ///     optional: data-entry MSB (CC6) when J=1
+    ///     optional: data-entry LSB (CC38) when K=1
     /// </summary>
     public byte[] EncodeChapterM(bool isLast)
     {
-        // Build the single log item for the current parameter
-        byte flagsByte = 0;
-        if (hasDataEntryMsb) flagsByte |= 0x80; // J
-        if (hasDataEntryLsb) flagsByte |= 0x40; // K
+        // Compute total chapter size for the header length field
+        int pendingSize = hasPendingParamMsb ? 1 : 0;
+        int itemsSize = 0;
+        foreach (var e in paramLog)
+            itemsSize += 3 + (e.HasDataMsb ? 1 : 0) + (e.HasDataLsb ? 1 : 0);
+        int totalSize = 2 + pendingSize + itemsSize;
 
-        // Log item size: PNUM_LSB + PNUM_MSB + flags + optional data bytes
-        int itemSize = 3
-            + (hasDataEntryMsb ? 1 : 0)
-            + (hasDataEntryLsb ? 1 : 0);
-
-        // Total chapter size = 2-byte header + log item
-        int totalSize = 2 + itemSize;
+        // U/W are hints (used with Z optimisation to omit PNUM_MSB per entry);
+        // we set them correctly for informational purposes even though Z=0 here.
+        bool allRpn  = paramLog.Count > 0 && !paramLog.Any(e => e.IsNrpn);
+        bool allNrpn = paramLog.Count > 0 && !paramLog.Any(e => !e.IsNrpn);
 
         var buf = new byte[totalSize];
 
-        // 2-byte header (big-endian)
         ushort hdr = (ushort)(
-            (isLast ? 0x8000 : 0)       // S
-            | (isNrpn ? 0 : 0x1000)     // U: all-RPN hint
-            | (isNrpn ? 0x0800 : 0)     // W: all-NRPN hint
-            | (totalSize & 0x03FF));    // Length (bits 9:0)
+            (isLast              ? 0x8000 : 0)  // S
+            | (hasPendingParamMsb ? 0x4000 : 0) // P
+            | (allRpn            ? 0x1000 : 0)  // U
+            | (allNrpn           ? 0x0800 : 0)  // W
+            | (totalSize & 0x03FF));             // Length
         buf[0] = (byte)(hdr >> 8);
         buf[1] = (byte)(hdr & 0xFF);
 
         int off = 2;
 
-        // Log item: PNUM_LSB byte (S=1 because this is the last/only item in the log)
-        buf[off++] = (byte)(0x80 | (paramLsb & 0x7F));
+        if (hasPendingParamMsb)
+            buf[off++] = (byte)((pendingIsNrpn ? 0x80 : 0) | (pendingParamMsb & 0x7F));
 
-        // Log item: PNUM_MSB byte (Q=1 if NRPN)
-        buf[off++] = (byte)((isNrpn ? 0x80 : 0) | (paramMsb & 0x7F));
+        for (int i = 0; i < paramLog.Count; i++)
+        {
+            var  e        = paramLog[i];
+            bool lastItem = i == paramLog.Count - 1;
 
-        // Log item: flags byte
-        buf[off++] = flagsByte;
+            buf[off++] = (byte)((lastItem   ? 0x80 : 0) | (e.ParamLsb & 0x7F)); // PNUM_LSB
+            buf[off++] = (byte)((e.IsNrpn   ? 0x80 : 0) | (e.ParamMsb & 0x7F)); // PNUM_MSB (Q=NRPN)
 
-        // Optional data-entry MSB (CC6)
-        if (hasDataEntryMsb)
-            buf[off++] = (byte)(dataEntryMsb & 0x7F);
+            byte flags = 0;
+            if (e.HasDataMsb) flags |= 0x80; // J
+            if (e.HasDataLsb) flags |= 0x40; // K
+            buf[off++] = flags;
 
-        // Optional data-entry LSB (CC38)
-        if (hasDataEntryLsb)
-            buf[off++] = (byte)(dataEntryLsb & 0x7F);
+            if (e.HasDataMsb) buf[off++] = (byte)(e.DataMsb & 0x7F);
+            if (e.HasDataLsb) buf[off++] = (byte)(e.DataLsb & 0x7F);
+        }
 
         return buf;
     }

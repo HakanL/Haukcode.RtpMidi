@@ -92,6 +92,12 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // --- Inbound sequence tracking for gap detection ---
     private ushort? expectedSeqNum;
 
+    // --- Cross-packet receive running status (P flag, RFC 6295 §3.2) ---
+    // Updated each time an RTP-MIDI data packet arrives. Passed to DecodeCommands
+    // so that P-flagged packets from peers that omit the status byte are correctly
+    // expanded, preventing truncated / corrupt MIDI events reaching subscribers.
+    private byte? lastReceivedStatus;
+
     // --- RS (Receiver Feedback) rate limiting ---
     private int rsPacketCount;
     private const int RsEveryNPackets = 10;
@@ -179,6 +185,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
         lastSysExPayload    = null;
         expectedSeqNum      = null;
         lastMidiStateSeqNum = 0;
+        lastReceivedStatus  = null;
         for (int i = 0; i < 16; i++) channelStates[i].Reset();
         systemMidiState.Reset();
         rsPacketCount = 0;
@@ -257,6 +264,7 @@ public sealed class RtpMidiSession : IRtpMidiSession
         lastSysExPayload    = null;
         expectedSeqNum      = null;
         lastMidiStateSeqNum = 0;
+        lastReceivedStatus  = null;
         for (int i = 0; i < 16; i++) channelStates[i].Reset();
         systemMidiState.Reset();
         rsPacketCount = 0;
@@ -715,9 +723,27 @@ public sealed class RtpMidiSession : IRtpMidiSession
                         if (TraceHook != null)
                             TraceHook($"[{localName}] RX seq={midiPkt.SequenceNumber} ts={midiPkt.Timestamp} midi={midiPkt.MidiBytes.Length}B firstMidi={Preview(midiPkt.MidiBytes.Span, 12)}");
 
-                        var assembled = AssembleSysExFragment(midiPkt.MidiBytes);
-                        if (assembled.HasValue)
-                            midiSubject.OnNext(assembled.Value);
+                        // Decode MIDI commands, expanding any phantom status (P flag) from
+                        // the previous packet and within-packet running status. This correctly
+                        // handles P-flagged packets from peers that use RFC 6295 §3.2 compression.
+                        var cmds = midiPkt.DecodeCommands(lastReceivedStatus);
+
+                        // Advance lastReceivedStatus for the next packet's phantom status.
+                        foreach (var cmd in cmds)
+                        {
+                            if (cmd.Data.IsEmpty) continue;
+                            byte s = cmd.Data.Span[0];
+                            if (s >= 0x80 && s < 0xF0)      lastReceivedStatus = s;
+                            else if (s >= 0xF0 && s < 0xF8) lastReceivedStatus = null;
+                        }
+
+                        foreach (var cmd in cmds)
+                        {
+                            if (cmd.Data.IsEmpty) continue;
+                            var assembled = AssembleSysExFragment(cmd.Data);
+                            if (assembled.HasValue)
+                                midiSubject.OnNext(assembled.Value);
+                        }
                     }
                 }
                 else

@@ -1,3 +1,5 @@
+using Haukcode.RtpMidi.Journal;
+
 namespace Haukcode.RtpMidi;
 
 /// <summary>
@@ -40,28 +42,27 @@ internal static class RtpMidiJournal
     private const byte JournalHeaderSystemPresent  = 0x80; // S
     private const byte JournalHeaderChannelPresent = 0x20; // A
 
-    // System journal header (§5.2) chapter flags
-    private const byte SysJournalFlagF = 0x40; // Chapter F (System Common)
-    private const byte SysJournalFlagX = 0x04; // Chapter X (SysEx)
+    // System / channel journal chapter flags are defined in RfcChapterRegistry
+    // and aliased here for readability at the call sites.
+    private const byte SysJournalFlagF = RfcChapterRegistry.SysFlagF;
+    private const byte SysJournalFlagX = RfcChapterRegistry.SysFlagX;
 
     // Keep the old name for backward-compat with existing tests
     private const byte SystemJournalHeaderXOnly = SysJournalFlagX;
 
-    // Chapter X (§A.3) header flags
+    // Chapter X (§B.2) header flags
     private const byte ChapterXLastChapterBit = 0x80;
     private const byte ChapterXCompleteBit    = 0x40;
 
     // Channel journal TOC byte bit positions, per RFC 6295 §5 Figure 9.
-    // Chapter N encodes BOTH NoteOn and NoteOff events (§A.6). Chapter E
-    // (Note Command Extras, §A.7) is reserved but not currently emitted.
-    private const byte ChapTocP = 0x80; // §A.2 Program Change
-    private const byte ChapTocC = 0x40; // §A.3 Control Change
-    private const byte ChapTocM = 0x20; // §A.4 Parameter System (RPN/NRPN)
-    private const byte ChapTocW = 0x10; // §A.5 Pitch Wheel
-    private const byte ChapTocN = 0x08; // §A.6 Note (On + Off)
-    private const byte ChapTocE = 0x04; // §A.7 Note Command Extras (reserved)
-    private const byte ChapTocT = 0x02; // §A.8 Channel Aftertouch
-    private const byte ChapTocA = 0x01; // §A.9 Poly Key Pressure
+    private const byte ChapTocP = RfcChapterRegistry.TocP;
+    private const byte ChapTocC = RfcChapterRegistry.TocC;
+    private const byte ChapTocM = RfcChapterRegistry.TocM;
+    private const byte ChapTocW = RfcChapterRegistry.TocW;
+    private const byte ChapTocN = RfcChapterRegistry.TocN;
+    private const byte ChapTocE = RfcChapterRegistry.TocE;
+    private const byte ChapTocT = RfcChapterRegistry.TocT;
+    private const byte ChapTocA = RfcChapterRegistry.TocA;
 
     // -------------------------------------------------------------------------
     // Legacy API — Chapter X only (unchanged, existing callers still work)

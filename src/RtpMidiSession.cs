@@ -952,6 +952,34 @@ public sealed class RtpMidiSession : IRtpMidiSession
             }
         }
         catch (OperationCanceledException) { }
+        catch (SocketException ex)
+        {
+            // Socket went away mid-sync (transient NIC flap, host sleep/wake,
+            // Win32 10054 on receive-bound UDP, etc.). Without this catch the
+            // task unwinds silently and CKs stop; the bridge then notices only
+            // after its own 60 s peer-liveness watchdog. Fire a clean
+            // disconnect so our reconnect logic gets the signal.
+            if (TraceHook != null)
+                TraceHook($"[{localName}] clock-sync loop aborted by SocketException {ex.SocketErrorCode}; triggering disconnect");
+            if (State == SessionState.Connected)
+                _ = DisconnectAsync();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Benign: a concurrent shutdown closed the socket under us.
+            // StopLoopsAsync / DisconnectAsync is already running.
+        }
+        catch (Exception ex)
+        {
+            // Catch-all guarantees the loop can never die quietly. Any
+            // unexpected exception triggers the same clean-disconnect path
+            // so the peer-liveness watchdog isn't the only signal that
+            // something is wrong.
+            if (TraceHook != null)
+                TraceHook($"[{localName}] clock-sync loop aborted unexpectedly: {ex.GetType().Name}: {ex.Message}; triggering disconnect");
+            if (State == SessionState.Connected)
+                _ = DisconnectAsync();
+        }
     }
 
     /// <summary>
@@ -1002,6 +1030,17 @@ public sealed class RtpMidiSession : IRtpMidiSession
             }
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            // The liveness watchdog is the last line of defense against a
+            // silently dead session. If IT dies silently the user never
+            // learns the peer is gone. Log via the trace hook and fire a
+            // disconnect — better a noisy false teardown than a quiet hang.
+            if (TraceHook != null)
+                TraceHook($"[{localName}] peer-liveness loop aborted unexpectedly: {ex.GetType().Name}: {ex.Message}; triggering disconnect");
+            if (State == SessionState.Connected)
+                _ = DisconnectAsync();
+        }
     }
 
     private async Task RunClockSyncAsync(CancellationToken ct)
@@ -1009,6 +1048,8 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (clockSync == null || controlSocket == null) return;
 
         var ck0 = clockSync.BuildCk0(localSsrc);
+        if (TraceHook != null)
+            TraceHook($"[{localName}] TX clock CK0 (control) ts1={ck0.Timestamp1}");
         await controlSocket.SendAsync(AppleSessionProtocol.EncodeClock(ck0), ct);
         // CK1 arrives in ReceiveLoopAsync → HandleClockPacketAsync → sends CK2
     }
@@ -1022,12 +1063,16 @@ public sealed class RtpMidiSession : IRtpMidiSession
             case 0:
                 // Remote initiated CK0 — we are responder, reply with CK1
                 var ck1 = clockSync.HandleCk0AndBuildCk1(localSsrc, pkt);
+                if (TraceHook != null)
+                    TraceHook($"[{localName}] TX clock CK1 (responder reply)");
                 await socket.SendAsync(AppleSessionProtocol.EncodeClock(ck1), ct);
                 break;
 
             case 1:
                 // We initiated, remote sent CK1 — complete with CK2
                 var ck2 = clockSync.HandleCk1AndBuildCk2(localSsrc, pkt);
+                if (TraceHook != null)
+                    TraceHook($"[{localName}] TX clock CK2 (initiator finish)");
                 await socket.SendAsync(AppleSessionProtocol.EncodeClock(ck2), ct);
                 break;
 

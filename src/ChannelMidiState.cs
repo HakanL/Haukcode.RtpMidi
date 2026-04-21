@@ -1,19 +1,22 @@
+using Haukcode.RtpMidi.Journal;
+using Haukcode.RtpMidi.Journal.Chapters;
+
 namespace Haukcode.RtpMidi;
 
 /// <summary>
-/// Tracks the per-channel MIDI state required to encode recovery journal
-/// chapters P, C, M, W, N, T, and A of RFC 6295.
+/// Per-channel MIDI state container AND journal-chapter coordinator. Owns the
+/// accumulated state for channel chapters P, C, M, W, N, T, A (RFC 6295
+/// Appendix A) and exposes matching <see cref="IChapterCodec"/> instances in
+/// TOC wire order so <see cref="RtpMidiJournal"/> can dispatch generically.
 ///
 /// ── RFC 6295 compliance notes ───────────────────────────────────────────────
-/// The implementation in this file follows the normative wire formats from
-/// Appendix A of RFC 6295 exactly. Where the older code (pre-April 2026) had
-/// quirks that were internally consistent but incompatible with strict-spec
-/// implementations, each fix is called out in a comment block at the
-/// relevant encoder/decoder.
+/// Normative wire formats from Appendix A are implemented in the per-chapter
+/// codec classes under <c>Journal/Chapters</c>. Compliance quirks are
+/// documented on the relevant codec and in <see cref="RfcChapterRegistry"/>.
 ///
 /// RFC term usage:
 ///   "LEN"    — chapter-specific count field; semantics differ per chapter
-///              (count minus one for C/E/A; count as-is for N; etc.).
+///              (count minus one for C/A; count as-is for N; etc.).
 ///   "LENGTH" — generic "bytes-including-header" length (channel journal
 ///              header uses this, NOT LEN).
 ///   "R bit"  — reserved; senders MUST set to 0, receivers MUST ignore.
@@ -23,6 +26,75 @@ namespace Haukcode.RtpMidi;
 /// </summary>
 internal sealed class ChannelMidiState
 {
+    // Per-chapter codec instances, constructed once per state and iterated
+    // in TOC wire order. Lazily initialised in the Chapters getter.
+    private IChapterCodec[]? _chapters;
+
+    /// <summary>
+    /// Channel-scoped chapter codecs in TOC wire order (P, C, M, W, N, T, A).
+    /// Chapter E (reserved) is not emitted.
+    /// </summary>
+    public IReadOnlyList<IChapterCodec> Chapters => _chapters ??=
+    [
+        new ChapterPCodec(this),
+        new ChapterCCodec(this),
+        new ChapterMCodec(paramLog),
+        new ChapterWCodec(this),
+        new ChapterNCodec(noteState),
+        new ChapterTCodec(this),
+        new ChapterACodec(this),
+    ];
+
+    /// <summary>
+    /// Parses a channel journal's chapter section (bytes AFTER the 3-byte
+    /// channel-journal header) driven by the TOC presence byte. Chapter
+    /// dispatch runs in TOC wire order; if the reserved Chapter E bit is set
+    /// we stop processing THIS channel's chapters (we cannot know E's size).
+    /// </summary>
+    public static void DecodeChapters(
+        ReadOnlySpan<byte> chapData,
+        byte               tocByte,
+        byte               channel,
+        List<byte[]>       recovered)
+    {
+        int cpos = 0;
+
+        // TOC wire order per §5 Figure 9: P, C, M, W, N, E, T, A.
+        foreach (var (bit, chapId) in s_channelTocOrder)
+        {
+            if ((tocByte & bit) == 0) continue;
+            if (chapId == 'E') return; // reserved — stop decoding this channel
+            int n = DecodeChannelChapter(chapId, chapData[cpos..], channel, recovered);
+            if (n < 0) return;
+            cpos += n;
+        }
+    }
+
+    private static readonly (byte bit, char id)[] s_channelTocOrder =
+    [
+        (RfcChapterRegistry.TocP, 'P'),
+        (RfcChapterRegistry.TocC, 'C'),
+        (RfcChapterRegistry.TocM, 'M'),
+        (RfcChapterRegistry.TocW, 'W'),
+        (RfcChapterRegistry.TocN, 'N'),
+        (RfcChapterRegistry.TocE, 'E'),
+        (RfcChapterRegistry.TocT, 'T'),
+        (RfcChapterRegistry.TocA, 'A'),
+    ];
+
+    private static int DecodeChannelChapter(char chapId, ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
+        => chapId switch
+        {
+            'P' => ChapterPCodec.DecodeStatic(data, channel, recovered),
+            'C' => ChapterCCodec.DecodeStatic(data, channel, recovered),
+            'M' => ChapterMCodec.DecodeStatic(data, channel, recovered),
+            'W' => ChapterWCodec.DecodeStatic(data, channel, recovered),
+            'N' => ChapterNCodec.DecodeStatic(data, channel, recovered),
+            'T' => ChapterTCodec.DecodeStatic(data, channel, recovered),
+            'A' => ChapterACodec.DecodeStatic(data, channel, recovered),
+            _   => -1,
+        };
+
     // -----------------------------------------------------------------------
     // Chapter P — Program Change
     // -----------------------------------------------------------------------

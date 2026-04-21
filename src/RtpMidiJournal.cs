@@ -338,7 +338,7 @@ internal static class RtpMidiJournal
                 // Chapter E bit is set, DecodeChapters stops processing THIS
                 // channel's chapters but we MUST continue to the next channel
                 // journal (pos has already been advanced by totalLen above).
-                ChannelJournalCoordinator.DecodeChapters(chapData, vb2, channel, recovered);
+                ChannelMidiState.DecodeChapters(chapData, vb2, channel, recovered);
             }
         }
 
@@ -397,9 +397,8 @@ internal static class RtpMidiJournal
     /// </summary>
     private static byte[] BuildChannelJournal(byte channel, ChannelMidiState state, bool isLastChannel)
     {
-        var coord   = new ChannelJournalCoordinator(state);
         var present = new List<IChapterCodec>(7);
-        foreach (var codec in coord.Chapters)
+        foreach (var codec in state.Chapters)
             if (codec.HasData) present.Add(codec);
 
         int      count    = present.Count;

@@ -304,16 +304,20 @@ internal sealed class ChannelMidiState
     /// </summary>
     public byte[] EncodeChapterP(bool isLast)
     {
-        bool bankValid  = HasBankCoarse || HasBankFine;
-        byte prog = Program;
-        byte bc   = BankCoarse;
-        byte bf   = BankFine;
+        // RFC 6295 §A.2.1 — Chapter P is exactly three octets, one 7-bit
+        // value per byte (with a 1-bit flag at bit 7 of each):
+        //   byte 0: S | PROGRAM[6:0]
+        //   byte 1: B | BANK-MSB[6:0]   (B = 1 when bank coarse has been sent)
+        //   byte 2: X | BANK-LSB[6:0]   (X = 1 when bank fine   has been sent)
+        byte prog = (byte)(Program    & 0x7F);
+        byte bc   = (byte)(BankCoarse & 0x7F);
+        byte bf   = (byte)(BankFine   & 0x7F);
 
         return
         [
-            (byte)((isLast ? 0x80 : 0) | (bankValid ? 0x40 : 0) | ((prog >> 1) & 0x3F)),
-            (byte)(((prog & 1) << 7) | (HasBankCoarse ? 0x40 : 0) | ((bc >> 1) & 0x3F)),
-            (byte)(((bc & 1) << 7) | (bf & 0x7F))
+            (byte)((isLast        ? 0x80 : 0) | prog),
+            (byte)((HasBankCoarse ? 0x80 : 0) | bc),
+            (byte)((HasBankFine   ? 0x80 : 0) | bf)
         ];
     }
 
@@ -550,28 +554,25 @@ internal sealed class ChannelMidiState
     {
         if (data.Length < 3) return -1;
 
+        // RFC 6295 §A.2.1 — straightforward 7-bit fields with flag at bit 7:
+        //   byte 0: S | PROGRAM
+        //   byte 1: B | BANK-MSB   (B flag = bank MSB value valid)
+        //   byte 2: X | BANK-LSB   (X flag = bank LSB value valid)
         byte b0 = data[0], b1 = data[1], b2 = data[2];
-        bool bankValid  = (b0 & 0x40) != 0;
-        byte prog       = (byte)(((b0 & 0x3F) << 1) | ((b1 >> 7) & 1));
-        bool bankCoarseActive = (b1 & 0x40) != 0;
-        byte bc         = (byte)(((b1 & 0x3F) << 1) | ((b2 >> 7) & 1));
-        byte bf         = (byte)(b2 & 0x7F);
+        byte prog  = (byte)(b0 & 0x7F);
+        bool hasBC = (b1 & 0x80) != 0;
+        byte bc    = (byte)(b1 & 0x7F);
+        bool hasBF = (b2 & 0x80) != 0;
+        byte bf    = (byte)(b2 & 0x7F);
 
-        if (bankValid && bankCoarseActive)
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 0, bc]);   // CC 0
-
-        if (bankValid && HasBankFineFromChapterP(b0, b1, b2))
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 32, bf]);  // CC 32
-
+        if (hasBC)
+            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 0, bc]);   // CC 0   (Bank MSB)
+        if (hasBF)
+            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 32, bf]);  // CC 32  (Bank LSB)
         recovered.Add([(byte)(0xC0 | (channel & 0x0F)), prog]);        // Program Change
 
         return 3;
     }
-
-    // Bank fine is always emitted together with bank coarse when B=1; the RFC does not
-    // provide a separate "bank fine valid" bit, so we always include both CC 0 and CC 32.
-    private static bool HasBankFineFromChapterP(byte b0, byte b1, byte b2)
-        => (b0 & 0x40) != 0; // B flag set — bank info is present
 
     /// <summary>
     /// Decodes Chapter C and appends the recovered Control Change messages

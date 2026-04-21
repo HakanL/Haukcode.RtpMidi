@@ -444,7 +444,7 @@ internal sealed class ChannelMidiState
     /// Encodes Chapter N (MIDI NoteOn and NoteOff) — RFC 6295 §A.6.
     ///
     ///   Header (2 octets, always):
-    ///     Byte 0:  B | LEN[6:0]         B = 1 by default (see §A.6.1)
+    ///     Byte 0:  B | LEN[6:0]         B = 1 always, per §A.6.1 guidance
     ///                                   LEN = number of note log entries (7-bit, not count-1)
     ///     Byte 1:  LOW[3:0] | HIGH[3:0]
     ///       If LOW ≤ HIGH, OFFBITS occupies (HIGH − LOW + 1) octets after the log list.
@@ -459,6 +459,15 @@ internal sealed class ChannelMidiState
     ///   note 8·LOW and successive bits advance by one note number. A set bit
     ///   codes a NoteOff command for that note.
     /// </summary>
+    /// <remarks>
+    /// Unlike other chapters, Chapter N uses byte-0 bit-7 as the <c>B</c> bit
+    /// (§A.6.1 — a per-chapter semantic indicating NoteOff-log presence hint),
+    /// NOT the generic per-chapter S "last in journal" bit. RFC §A.6.1 guidance
+    /// is to set B=1 and we follow that unconditionally. The
+    /// <paramref name="isLast"/> parameter is accepted for interface uniformity
+    /// with other chapter encoders (so the orchestrator can dispatch chapters
+    /// generically) but is not used by this encoder.
+    /// </remarks>
     public byte[] EncodeChapterN(bool isLast)
     {
         // ── Gather the note log list (notes whose most recent event is NoteOn) ──
@@ -519,13 +528,9 @@ internal sealed class ChannelMidiState
         int total = 2 + logCount * 2 + offbitsBytes;
         var buf = new byte[total];
 
-        // Header (2 octets)
-        // B-bit default is 1 per §A.6.1 (the NoteOff bitfield's S-equivalent).
-        // isLast is carried by higher-level chapter ordering; the S bit for the
-        // *chapter overall* lives in byte 0 of chapter W / chapter C etc., but
-        // Chapter N uses B in its place. We treat isLast only as a TODO hook;
-        // for compliance with strict receivers we set B=1 always.
-        _ = isLast;
+        // Header (2 octets). B (byte 0 bit 7) is always 1 per §A.6.1; see the
+        // <remarks> section on this method for why isLast is accepted but
+        // intentionally unused.
         buf[0] = (byte)(0x80 | (lenField & 0x7F));
         buf[1] = (byte)(((low & 0x0F) << 4) | (high & 0x0F));
 

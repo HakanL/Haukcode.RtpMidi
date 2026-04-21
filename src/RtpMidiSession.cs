@@ -593,6 +593,15 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     var result = await socket.ReceiveAsync(delayCts.Token);
                     if (TryHandleSessionPacket(result.Buffer, out var response) && response != null)
                     {
+                        // Version mismatch on the OK: remote speaks a different
+                        // Apple-MIDI dialect. Treat as refusal so we don't build
+                        // a session on top of untested protocol assumptions.
+                        if (response.Command == AppleSessionCommand.InvitationAccepted
+                            && response.ProtocolVersion != AppleSessionProtocol.ProtocolVersion)
+                        {
+                            throw new InvalidOperationException(
+                                $"Remote accepted invitation with unsupported protocol version {response.ProtocolVersion} (expected {AppleSessionProtocol.ProtocolVersion}). Remote: {remote}");
+                        }
                         if (response.Command == AppleSessionCommand.InvitationAccepted)
                         {
                             remoteSsrc  = response.Ssrc;
@@ -625,6 +634,25 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
             if (packet.Command != AppleSessionCommand.Invitation)
                 continue;
+
+            // RFC: only Apple-MIDI protocol version 2 is defined. Reject any
+            // other version with AM_NO so the remote gives up fast rather
+            // than assuming we'll speak their dialect. Every deployed peer
+            // sends version 2 today, but this is cheap defensive hardening
+            // against a misconfigured or buggy remote.
+            if (packet.ProtocolVersion != AppleSessionProtocol.ProtocolVersion)
+            {
+                var no = new SessionPacket(
+                    AppleSessionCommand.InvitationRefused,
+                    AppleSessionProtocol.ProtocolVersion,
+                    packet.InitiatorToken,
+                    localSsrc,
+                    localName);
+                if (TraceHook != null)
+                    TraceHook($"[{localName}] TX session InvitationRefused (NO) to {result.RemoteEndPoint} — unsupported protocol version {packet.ProtocolVersion} (expected {AppleSessionProtocol.ProtocolVersion})");
+                await socket.SendAsync(AppleSessionProtocol.Encode(no), result.RemoteEndPoint, ct);
+                continue;
+            }
 
             remoteSsrc = packet.Ssrc;
             RemoteName = packet.Name;

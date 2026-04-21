@@ -154,8 +154,47 @@ public class SessionLivenessTests
         return u.Client.LocalEndPoint as IPEndPoint;
     }
 
+    [Fact]
+    public async Task InvitationWithUnsupportedVersion_IsRefusedWithNO()
+    {
+        // Raw UDP peer sending a malformed IN with protocolVersion = 99.
+        // Haukcode's AcceptPortAsync should reply AM_NO and continue listening
+        // rather than promoting the session. Without the version gate, it
+        // would quietly accept and attempt a handshake over a dialect it
+        // doesn't actually speak.
+        int port = FreeUdpPortPair();
+
+        await using var listener = new RtpMidiSession("listener");
+        using var listenCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var listenTask = listener.ListenAsync(port, listenCts.Token);
+        await Task.Delay(100);
+
+        using var rawPeer = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        byte[] badInvite = BuildInvitationPacket(
+            token: 0xCAFEBABEu, ssrc: 0x11223344u, name: "bad-version", version: 99);
+        await rawPeer.SendAsync(badInvite, badInvite.Length,
+                                new IPEndPoint(IPAddress.Loopback, port));
+
+        // Expect an AM_NO back.
+        using var recvCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var reply = await rawPeer.ReceiveAsync(recvCts.Token);
+
+        // First two bytes = 0xFFFF magic; bytes 2-3 = 'N','O'.
+        Assert.True(reply.Buffer.Length >= 4);
+        Assert.Equal(0xFF, reply.Buffer[0]);
+        Assert.Equal(0xFF, reply.Buffer[1]);
+        Assert.Equal((byte)'N', reply.Buffer[2]);
+        Assert.Equal((byte)'O', reply.Buffer[3]);
+
+        // Listener should still be listening (no session established).
+        Assert.Equal(SessionState.ConnectingControl, listener.State);
+
+        listenCts.Cancel();
+        try { await listenTask; } catch { /* expected */ }
+    }
+
     /// <summary>Hand-build an AppleMIDI Invitation (IN) packet.</summary>
-    private static byte[] BuildInvitationPacket(uint token, uint ssrc, string name)
+    private static byte[] BuildInvitationPacket(uint token, uint ssrc, string name, uint version = 2)
     {
         var nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
         byte[] buf = new byte[16 + nameBytes.Length + 1];
@@ -163,8 +202,11 @@ public class SessionLivenessTests
         buf[0] = 0xFF; buf[1] = 0xFF;
         // "IN"
         buf[2] = (byte)'I'; buf[3] = (byte)'N';
-        // protocol version (2), big-endian 32-bit
-        buf[4] = 0; buf[5] = 0; buf[6] = 0; buf[7] = 2;
+        // protocol version, big-endian 32-bit
+        buf[4] = (byte)(version >> 24);
+        buf[5] = (byte)(version >> 16);
+        buf[6] = (byte)(version >> 8);
+        buf[7] = (byte)version;
         // initiator token
         buf[8]  = (byte)(token >> 24);
         buf[9]  = (byte)(token >> 16);

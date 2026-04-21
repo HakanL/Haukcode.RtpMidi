@@ -183,6 +183,35 @@ public class RtpMidiPacketTests
         Assert.Equal(SimpleMidi, pkt!.MidiBytes.ToArray());
     }
 
+    // -------------------------------------------------------------------------
+    // RFC 4695 §3.4 — Marker bit (M=1)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Encode_SetsMarkerBit_OnEveryPacket()
+    {
+        // RFC 4695 §3.4: M=1 signals a phrase start.  Apple CoreMIDI and many
+        // hardware bridges set M=1 on every packet.  Byte[1] of the RTP header
+        // is 0x80 | PT(97) = 0xE1.
+        var encoded = RtpMidiPacket.Encode(0x01, 1, 0, SimpleMidi);
+
+        Assert.Equal(0xE1, encoded[1]); // M=1(0x80) | PT=97(0x61)
+    }
+
+    [Fact]
+    public void Parse_AcceptsPacketWithMarkerBit_Set()
+    {
+        // TryParse already strips the M bit via (data[1] & 0x7F); this confirms
+        // that a packet with M=1 still round-trips correctly.
+        var encoded = RtpMidiPacket.Encode(0xAABBCCDD, 77, 5000, SimpleMidi);
+        Assert.Equal(0xE1, encoded[1]);
+
+        Assert.True(RtpMidiPacket.TryParse(encoded, out var pkt));
+        Assert.NotNull(pkt);
+        Assert.Equal(77, pkt!.SequenceNumber);
+        Assert.Equal(SimpleMidi, pkt.MidiBytes.ToArray());
+    }
+
     [Fact]
     public void Parse_RejectsPacket_WhenCCMakesBufferTooShort()
     {

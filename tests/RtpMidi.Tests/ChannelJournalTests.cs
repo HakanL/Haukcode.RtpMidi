@@ -1035,6 +1035,81 @@ public class ChannelJournalTests
     }
 
     // =========================================================================
+    // Chapter E (§A.7) — remote-emitted; library does not emit it.
+    //
+    // When Chapter E is present in a channel journal the size of the E block is
+    // unknown (the library doesn't implement §A.7), so the remaining chapters of
+    // THAT channel (T and A) are skipped. Crucially, subsequent channel journals
+    // in the same recovery journal MUST still be decoded (regression: a `break`
+    // instead of `continue` would silently discard them all).
+    // =========================================================================
+
+    [Fact]
+    public void ChapterE_Present_SubsequentChannelJournalsStillDecoded()
+    {
+        // Build a two-channel journal by hand:
+        //   Channel 0: TOC = N | E  (note-on log + chapter E stub)
+        //   Channel 1: TOC = C      (CC volume=64, no Chapter E)
+        //
+        // Channel 0 journal:
+        //   vb0 = 0x00 | (ch=0)<<3 | H=0 | len_hi = 0x00 (S=0, not last channel)
+        //   vb1 = totalLen (3 header + 4 note log + 0 ChapE stub = 7)
+        //   vb2 = N(0x08) | E(0x04) = 0x0C
+        //   ChapterN: B=1,LEN=1, LOW=15,HIGH=0 (no offbits), S=1,NOTE=60,Y=0,VEL=80
+        // Channel 1 journal (isLast=true):
+        //   vb0 = 0x80 | (ch=1)<<3 | 0 | len_hi = 0x80 | 0x08 = 0x88
+        //   vb1 = totalLen (3 header + 3 ChapC = 6)
+        //   vb2 = C(0x40) = 0x40
+        //   ChapterC: S=1,LEN=0 (1 entry), S=1,CC=7, VALUE=64
+
+        // Channel 0: header length = 3 (header) + 4 (ChapN, 2-byte hdr + 1×2-byte entry) = 7
+        byte ch0Len = 7;
+        byte[] ch0 =
+        [
+            (byte)((0 << 3) | ((ch0Len >> 8) & 0x03)),  // S=0, CHAN=0, H=0, len_hi
+            (byte)(ch0Len & 0xFF),                        // len_lo
+            0x0C,                                         // TOC: N | E
+            // Chapter N: B=1, LEN=1 note log, LOW=15, HIGH=0 → no offbits
+            0x81, 0xF0,
+            // note log: S=1, NOTE=60, Y=0, VEL=80
+            0xBC, 0x50,
+        ];
+        Assert.Equal(ch0Len, ch0.Length); // sanity
+
+        // Channel 1: header length = 3 (header) + 3 (ChapC: 1 hdr + 2 bytes) = 6
+        byte ch1Len = 6;
+        byte[] ch1 =
+        [
+            (byte)(0x80 | (1 << 3) | ((ch1Len >> 8) & 0x03)), // S=1 (last), CHAN=1, H=0, len_hi
+            (byte)(ch1Len & 0xFF),                              // len_lo
+            0x40,                                               // TOC: C
+            // Chapter C: S=1,LEN=0 (1 entry), then S=1,CC=7, VALUE=64
+            0x80, 0x87, 0x40,
+        ];
+        Assert.Equal(ch1Len, ch1.Length);
+
+        // Build the full recovery journal:
+        //   3-byte journal header: A=1, TOTCHAN=1 (= 2 channels - 1), checkpoint=99
+        var journal = new byte[3 + ch0.Length + ch1.Length];
+        journal[0] = 0x20 | 0x01; // A=1, TOTCHAN=1
+        journal[1] = 0x00;
+        journal[2] = 99; // checkpoint seqnum
+        ch0.CopyTo(journal, 3);
+        ch1.CopyTo(journal, 3 + ch0.Length);
+
+        Assert.True(RtpMidiJournal.TryParseFullJournal(journal, out var checkpoint, out var recovered));
+        Assert.Equal(99, checkpoint);
+        Assert.NotNull(recovered);
+
+        // Channel 0: Chapter N should have recovered Note On 60 vel 80.
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0x90, 60, 80 }));
+
+        // Channel 1: Chapter C CC volume=64 MUST be recovered despite Chapter E
+        // on channel 0 (the `continue` fix — old `break` would have dropped this).
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0xB1, 7, 64 }));
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 

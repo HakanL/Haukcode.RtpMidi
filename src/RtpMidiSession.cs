@@ -96,6 +96,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
     private int rsPacketCount;
     private const int RsEveryNPackets = 10;
 
+    // --- Channel/system journal checkpoint tracking ---
+    // Sequence number of the last packet that caused any channel or system state
+    // update. When RS confirms receipt of that packet we can clear the accumulated
+    // state so the journal only carries new events, rather than growing indefinitely.
+    // Zero means no channel/system state has been accumulated since the last reset.
+    private ushort lastMidiStateSeqNum;
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -168,9 +175,10 @@ public sealed class RtpMidiSession : IRtpMidiSession
         sessionStart     = DateTime.UtcNow;
         clockSync        = new ClockSync(sessionStart);
         initiatorToken   = AppleSessionProtocol.GenerateInitiatorToken();
-        sequenceNumber   = (ushort)Random.Shared.Next(0, ushort.MaxValue);
-        lastSysExPayload = null;
-        expectedSeqNum   = null;
+        sequenceNumber      = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+        lastSysExPayload    = null;
+        expectedSeqNum      = null;
+        lastMidiStateSeqNum = 0;
         for (int i = 0; i < 16; i++) channelStates[i].Reset();
         systemMidiState.Reset();
         rsPacketCount = 0;
@@ -245,9 +253,10 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
         sessionStart = DateTime.UtcNow;
         clockSync    = new ClockSync(sessionStart);
-        sequenceNumber   = (ushort)Random.Shared.Next(0, ushort.MaxValue);
-        lastSysExPayload = null;
-        expectedSeqNum   = null;
+        sequenceNumber      = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+        lastSysExPayload    = null;
+        expectedSeqNum      = null;
+        lastMidiStateSeqNum = 0;
         for (int i = 0; i < 16; i++) channelStates[i].Reset();
         systemMidiState.Reset();
         rsPacketCount = 0;
@@ -352,11 +361,13 @@ public sealed class RtpMidiSession : IRtpMidiSession
                     // Channel message — update per-channel state
                     byte channel = (byte)(status & 0x0F);
                     channelStates[channel].ProcessMidi(data);
+                    lastMidiStateSeqNum = sequenceNumber;
                 }
                 else if (status == 0xF1 || status == 0xF2 || status == 0xF3)
                 {
                     // System Common — update system state for Chapter F
                     systemMidiState.ProcessMidi(data);
+                    lastMidiStateSeqNum = sequenceNumber;
                 }
             }
         }
@@ -605,13 +616,27 @@ public sealed class RtpMidiSession : IRtpMidiSession
                         if (TraceHook != null)
                             TraceHook($"[{localName}] RX session RS from {result.RemoteEndPoint} ssrc={feedbackPkt.Ssrc:X8} lastSeq={feedbackPkt.LastReceivedSequence}");
 
-                        // Advance recovery journal checkpoint: if the remote has confirmed
-                        // receiving our SysEx packet (or any packet after it), clear the
-                        // journal so we stop carrying stale data.
+                        // Advance recovery journal checkpoint.
+                        // Once the remote confirms receipt of the packet that first carried
+                        // a given state snapshot we can discard that state — the remote
+                        // already has it and no longer needs journal recovery for it.
+                        // Signed comparison handles ushort wraparound correctly.
                         if (lastSysExPayload != null
                             && (short)(feedbackPkt.LastReceivedSequence - lastSysExSeqNum) >= 0)
                         {
                             lastSysExPayload = null;
+                        }
+
+                        // Clear channel/system journal state once the remote has confirmed
+                        // the packet that contained the most-recent state update. After this
+                        // point only new MIDI events accumulate in the journal; the remote
+                        // already has all previously journalled state.
+                        if (lastMidiStateSeqNum != 0
+                            && (short)(feedbackPkt.LastReceivedSequence - lastMidiStateSeqNum) >= 0)
+                        {
+                            for (int i = 0; i < 16; i++) channelStates[i].Reset();
+                            systemMidiState.Reset();
+                            lastMidiStateSeqNum = 0;
                         }
                     }
                     else if (sessionPkt != null)

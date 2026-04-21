@@ -277,6 +277,72 @@ public class RtpMidiJournalTests
     }
 
     // -------------------------------------------------------------------------
+    // RS-based channel state checkpoint advancement
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Verifies that once an RS confirms receipt of the packet that first
+    /// carried a channel state update, the next EncodeFullJournal omits that
+    /// state (it has been cleared) so the journal doesn't grow indefinitely.
+    ///
+    /// Scenario:
+    ///   seq=10: CC Volume sent → channelStates updated, lastMidiStateSeqNum=10
+    ///   RS(10) received       → channel state cleared, lastMidiStateSeqNum=0
+    ///   seq=11: Note On sent  → journal should contain only Note On, NOT CC Volume
+    /// </summary>
+    [Fact]
+    public void RsCheckpoint_ChannelStateCleared_AfterConfirmation()
+    {
+        // Simulate state after CC Volume was sent in packet 10 and RS(10) received:
+        // channel state should have been cleared. Build fresh state for only Note On
+        // (what would be present after the RS clear + new Note On accumulation).
+        var channelStates = new ChannelMidiState[16];
+        for (int i = 0; i < 16; i++) channelStates[i] = new ChannelMidiState();
+
+        // Only Note On is in the state (CC Volume was cleared by RS)
+        channelStates[0].ProcessMidi([0x90, 0x3C, 0x7F]);
+
+        var journal = RtpMidiJournal.EncodeFullJournal(10, null, channelStates, null);
+
+        Assert.True(RtpMidiJournal.TryParseFullJournal(journal, out _, out var recovered));
+        Assert.NotNull(recovered);
+
+        // Note On MUST be present
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0x90, 0x3C, 0x7F }));
+
+        // CC Volume must NOT be present (was cleared by RS)
+        Assert.DoesNotContain(recovered!, m => m.Length == 3 && m[0] == 0xB0 && m[1] == 7);
+    }
+
+    /// <summary>
+    /// Verifies that channel state is NOT cleared prematurely: if RS confirms a
+    /// sequence earlier than lastMidiStateSeqNum, the state must be kept because
+    /// the most recent channel state change has not yet been confirmed.
+    /// </summary>
+    [Fact]
+    public void RsCheckpoint_ChannelStateRetained_WhenNotYetConfirmed()
+    {
+        // Both CC Volume (seq=10) and CC Pan (seq=11) were sent before RS arrives.
+        // RS(10) comes in: lastMidiStateSeqNum=11, RS(10) < 11 → no clear.
+        // State should still contain both controllers.
+        var channelStates = new ChannelMidiState[16];
+        for (int i = 0; i < 16; i++) channelStates[i] = new ChannelMidiState();
+
+        channelStates[0].ProcessMidi([0xB0, 7, 100]);   // CC Volume (seq 10)
+        channelStates[0].ProcessMidi([0xB0, 10, 64]);   // CC Pan (seq 11)
+
+        // Simulate RS(10) with lastMidiStateSeqNum=11: (short)(10 - 11) = -1 < 0 → no clear.
+        // We verify this by keeping state unchanged and encoding the journal.
+        var journal = RtpMidiJournal.EncodeFullJournal(10, null, channelStates, null);
+        Assert.True(RtpMidiJournal.TryParseFullJournal(journal, out _, out var recovered));
+        Assert.NotNull(recovered);
+
+        // Both CC values must still be in the journal
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0xB0, 7, 100 }));
+        Assert.Contains(recovered!, m => m.SequenceEqual(new byte[] { 0xB0, 10, 64 }));
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

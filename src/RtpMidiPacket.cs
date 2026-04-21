@@ -174,7 +174,9 @@ public sealed class RtpMidiPacket
 
         // RTP header
         buf[0] = RtpVersion;
-        buf[1] = PayloadType;
+        // M=1 (marker bit, RFC 4695 §3.4): marks phrase start. Apple CoreMIDI sets this on
+        // every packet; many hardware receivers depend on it for phrase boundary detection.
+        buf[1] = (byte)(0x80 | PayloadType);
         BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(2), sequenceNumber);
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(4), timestamp);
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(8), ssrc);
@@ -243,7 +245,7 @@ public sealed class RtpMidiPacket
 
         // RTP header
         buf[0] = RtpVersion;
-        buf[1] = PayloadType;
+        buf[1] = (byte)(0x80 | PayloadType); // M=1: phrase-start marker (RFC 4695 §3.4)
         BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(2), sequenceNumber);
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(4), timestamp);
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(8), ssrc);

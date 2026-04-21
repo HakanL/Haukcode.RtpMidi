@@ -396,13 +396,16 @@ internal static class RtpMidiJournal
                 }
 
                 // Chapter E (§A.7) is not emitted by this library and not
-                // decoded for recovery. If a remote sets the E bit we simply
-                // skip over the remaining bytes in this channel journal -- the
-                // LENGTH field has already advanced `pos` past everything, so
-                // we just stop chapter dispatching early.
+                // decoded for recovery. If a remote sets the E bit we skip the
+                // remaining chapters of THIS channel journal (T and A cannot be
+                // safely parsed without knowing Chapter E's size) but MUST
+                // continue processing subsequent channel journals — `pos` has
+                // already been advanced by `totalLen` so the next ci iteration
+                // starts at the correct offset.  A `break` here would silently
+                // drop all remaining channel journals, which is a correctness bug.
                 if ((vb2 & ChapTocE) != 0)
                 {
-                    break;
+                    continue;
                 }
 
                 if ((vb2 & ChapTocT) != 0)

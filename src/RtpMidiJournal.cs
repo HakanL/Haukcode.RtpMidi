@@ -1,4 +1,5 @@
 using Haukcode.RtpMidi.Journal;
+using Haukcode.RtpMidi.Journal.Chapters;
 
 namespace Haukcode.RtpMidi;
 
@@ -50,10 +51,6 @@ internal static class RtpMidiJournal
     // Keep the old name for backward-compat with existing tests
     private const byte SystemJournalHeaderXOnly = SysJournalFlagX;
 
-    // Chapter X (§B.2) header flags
-    private const byte ChapterXLastChapterBit = 0x80;
-    private const byte ChapterXCompleteBit    = 0x40;
-
     // Channel journal TOC byte bit positions, per RFC 6295 §5 Figure 9.
     private const byte ChapTocP = RfcChapterRegistry.TocP;
     private const byte ChapTocC = RfcChapterRegistry.TocC;
@@ -80,10 +77,11 @@ internal static class RtpMidiJournal
     /// <returns>Journal bytes ready to be appended after the MIDI command section.</returns>
     public static byte[] EncodeChapterX(ushort checkpointSeqNum, ReadOnlySpan<byte> sysExPayload)
     {
-        int len = sysExPayload.Length;
+        // Chapter X body (2-byte header + payload) via the codec.
+        byte[] chapterX = new ChapterXCodec(sysExPayload.ToArray()).Encode(isLastChapterInJournal: true);
 
-        // 3 (journal header) + 1 (system journal header) + 2 (chapter X header) + len (data)
-        var buf = new byte[6 + len];
+        // 3 (journal header) + 1 (system journal header) + chapterX bytes
+        var buf = new byte[4 + chapterX.Length];
 
         // Recovery journal header (3 bytes, §5.1)
         buf[0] = JournalHeaderSystemPresent;
@@ -92,15 +90,8 @@ internal static class RtpMidiJournal
         // System journal header (1 byte, §5.2) — only chapter X present
         buf[3] = SystemJournalHeaderXOnly;
 
-        // Chapter X header (2 bytes, §A.3)
-        // S=1 (last/only chapter), F=1 if SysEx ends with F7 (complete message)
-        bool isComplete = len > 0 && sysExPayload[len - 1] == 0xF7;
-        buf[4] = (byte)(ChapterXLastChapterBit
-                      | (isComplete ? ChapterXCompleteBit : 0)
-                      | ((len >> 8) & 0x3F));
-        buf[5] = (byte)(len & 0xFF);
-
-        sysExPayload.CopyTo(buf.AsSpan(6));
+        // Chapter X block
+        chapterX.CopyTo(buf, 4);
 
         return buf;
     }
@@ -155,16 +146,14 @@ internal static class RtpMidiJournal
         {
             // Skip Chapter F: consume its variable-length body
             if (data.Length <= pos) return true;
-            int consumed = GetChapterFSize(data[pos..]);
+            int consumed = ChapterFCodec.GetSize(data[pos..]);
             if (consumed < 0) return true;
             pos += consumed;
         }
 
         // Now pos points at Chapter X
-        if (data.Length < pos + 2)
-            return false;
-
-        int xLen = ((data[pos] & 0x3F) << 8) | data[pos + 1];
+        int xLen = ChapterXCodec.PeekLength(data[pos..]);
+        if (xLen < 0) return false;
 
         if (data.Length < pos + 2 + xLen)
             return false;
@@ -326,13 +315,9 @@ internal static class RtpMidiJournal
 
             if ((sysHdr & SysJournalFlagX) != 0)
             {
-                // Chapter X
-                if (data.Length < pos + 2) return false;
-                int xLen = ((data[pos] & 0x3F) << 8) | data[pos + 1];
-                pos += 2;
-                if (data.Length < pos + xLen) return false;
-                recovered.Add(data.Slice(pos, xLen).ToArray());
-                pos += xLen;
+                int consumed = ChapterXCodec.DecodeStatic(data[pos..], recovered);
+                if (consumed < 0) return false;
+                pos += consumed;
             }
         }
 
@@ -444,18 +429,13 @@ internal static class RtpMidiJournal
         // Chapter F data (if present)
         byte[]? chapterFBytes = hasSysF ? systemState!.EncodeChapterF(isLast: !hasSysEx) : null;
 
-        // Chapter X data (if present)
+        // Chapter X data (if present) — always the last chapter in the system
+        // journal, hence isLastChapterInJournal: true.
         byte[]? chapterXBytes = null;
         if (hasSysEx && lastSysExPayload != null)
         {
-            int xLen       = lastSysExPayload.Length;
-            bool isComplete = xLen > 0 && lastSysExPayload[xLen - 1] == 0xF7;
-            chapterXBytes = new byte[2 + xLen];
-            chapterXBytes[0] = (byte)(ChapterXLastChapterBit
-                                    | (isComplete ? ChapterXCompleteBit : 0)
-                                    | ((xLen >> 8) & 0x3F));
-            chapterXBytes[1] = (byte)(xLen & 0xFF);
-            lastSysExPayload.CopyTo(chapterXBytes, 2);
+            chapterXBytes = new ChapterXCodec(lastSysExPayload)
+                .Encode(isLastChapterInJournal: true);
         }
 
         // System journal header byte
@@ -553,18 +533,4 @@ internal static class RtpMidiJournal
         return journal;
     }
 
-    /// <summary>
-    /// Returns the total byte size of a Chapter F block starting at <paramref name="data"/>,
-    /// or -1 if the data is too short.
-    /// </summary>
-    private static int GetChapterFSize(ReadOnlySpan<byte> data)
-    {
-        if (data.IsEmpty) return -1;
-        byte hdr = data[0];
-        bool hasD = (hdr & 0x40) != 0;
-        bool hasV = (hdr & 0x20) != 0;
-        bool hasQ = (hdr & 0x10) != 0;
-        int size = 1 + (hasD ? 1 : 0) + (hasV ? 2 : 0) + (hasQ ? 1 : 0);
-        return data.Length >= size ? size : -1;
-    }
 }

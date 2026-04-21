@@ -375,26 +375,9 @@ internal sealed class ChannelMidiState
     // Chapter encoding
     // -----------------------------------------------------------------------
 
-    /// <summary>
-    /// Encodes Chapter P (Program Change) — fixed 3 bytes (RFC 6295 §A.2).
-    ///
-    ///   Byte 0:  S | PROGRAM[6:0]
-    ///   Byte 1:  B | BANK-MSB[6:0]   B = 1 when bank coarse (CC 0) was sent before this PC
-    ///   Byte 2:  X | BANK-LSB[6:0]   X = 1 when bank fine (CC 32) was sent between coarse and PC
-    /// </summary>
+    /// <summary>Encodes Chapter P. Delegates to <see cref="Journal.Chapters.ChapterPCodec"/>.</summary>
     public byte[] EncodeChapterP(bool isLast)
-    {
-        byte prog = (byte)(Program    & 0x7F);
-        byte bc   = (byte)(BankCoarse & 0x7F);
-        byte bf   = (byte)(BankFine   & 0x7F);
-
-        return
-        [
-            (byte)((isLast        ? 0x80 : 0) | prog),
-            (byte)((HasBankCoarse ? 0x80 : 0) | bc),
-            (byte)((HasBankFine   ? 0x80 : 0) | bf)
-        ];
-    }
+        => new Journal.Chapters.ChapterPCodec(this).Encode(isLast);
 
     /// <summary>
     /// Encodes Chapter C (Control Change) — RFC 6295 §A.3.
@@ -425,20 +408,9 @@ internal sealed class ChannelMidiState
             isLast, entries.Slice(0, count), secondByteFlagMask: 0x00);
     }
 
-    /// <summary>
-    /// Encodes Chapter W (Pitch Wheel) — fixed 2 bytes (RFC 6295 §A.5).
-    ///
-    ///   Byte 0:  S | FIRST[6:0]    FIRST  = LSB of the most-recent pitch wheel data
-    ///   Byte 1:  R | SECOND[6:0]   SECOND = MSB. R is reserved (MUST be 0).
-    /// </summary>
+    /// <summary>Encodes Chapter W. Delegates to <see cref="Journal.Chapters.ChapterWCodec"/>.</summary>
     public byte[] EncodeChapterW(bool isLast)
-    {
-        return
-        [
-            (byte)((isLast ? 0x80 : 0) | (PitchLsb & 0x7F)),
-            (byte)(PitchMsb & 0x7F),  // R = 0; SECOND in low 7 bits
-        ];
-    }
+        => new Journal.Chapters.ChapterWCodec(this).Encode(isLast);
 
     /// <summary>
     /// Encodes Chapter N (MIDI NoteOn and NoteOff) — RFC 6295 §A.6.
@@ -563,15 +535,9 @@ internal sealed class ChannelMidiState
         return buf;
     }
 
-    /// <summary>
-    /// Encodes Chapter T (Channel Aftertouch) — fixed 1 byte (RFC 6295 §A.8).
-    ///
-    ///   Byte 0: S | PRESSURE[6:0]
-    /// </summary>
+    /// <summary>Encodes Chapter T. Delegates to <see cref="Journal.Chapters.ChapterTCodec"/>.</summary>
     public byte[] EncodeChapterT(bool isLast)
-    {
-        return [(byte)((isLast ? 0x80 : 0) | (ChannelPressure & 0x7F))];
-    }
+        => new Journal.Chapters.ChapterTCodec(this).Encode(isLast);
 
     /// <summary>
     /// Encodes Chapter A (Poly Key Pressure) — RFC 6295 §A.9.
@@ -664,30 +630,9 @@ internal sealed class ChannelMidiState
     // Chapter decoding  (static: parse bytes → MIDI messages)
     // -----------------------------------------------------------------------
 
-    /// <summary>
-    /// Decodes Chapter P (RFC 6295 §A.2) and appends recovered Program Change
-    /// (and optional bank-select Control Changes) to <paramref name="recovered"/>.
-    /// Returns bytes consumed (always 3) or -1 on error.
-    /// </summary>
+    /// <summary>Decodes Chapter P. Delegates to <see cref="Journal.Chapters.ChapterPCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterP(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.Length < 3) return -1;
-
-        byte b0 = data[0], b1 = data[1], b2 = data[2];
-        byte prog  = (byte)(b0 & 0x7F);
-        bool hasBC = (b1 & 0x80) != 0;
-        byte bc    = (byte)(b1 & 0x7F);
-        bool hasBF = (b2 & 0x80) != 0;
-        byte bf    = (byte)(b2 & 0x7F);
-
-        if (hasBC)
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 0, bc]);
-        if (hasBF)
-            recovered.Add([(byte)(0xB0 | (channel & 0x0F)), 32, bf]);
-        recovered.Add([(byte)(0xC0 | (channel & 0x0F)), prog]);
-
-        return 3;
-    }
+        => Journal.Chapters.ChapterPCodec.DecodeStatic(data, channel, recovered);
 
     /// <summary>
     /// Decodes Chapter C (RFC 6295 §A.3): LEN = (count − 1) in 7 bits, then
@@ -717,19 +662,9 @@ internal sealed class ChannelMidiState
         return required;
     }
 
-    /// <summary>
-    /// Decodes Chapter W (RFC 6295 §A.5). Returns bytes consumed (2) or -1.
-    /// </summary>
+    /// <summary>Decodes Chapter W. Delegates to <see cref="Journal.Chapters.ChapterWCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterW(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.Length < 2) return -1;
-
-        byte lsb = (byte)(data[0] & 0x7F);
-        byte msb = (byte)(data[1] & 0x7F); // R bit in position 7 is ignored
-        recovered.Add([(byte)(0xE0 | (channel & 0x0F)), lsb, msb]);
-
-        return 2;
-    }
+        => Journal.Chapters.ChapterWCodec.DecodeStatic(data, channel, recovered);
 
     /// <summary>
     /// Decodes Chapter N (RFC 6295 §A.6): 2-byte header with 7-bit LEN (= note
@@ -800,18 +735,9 @@ internal sealed class ChannelMidiState
         return required;
     }
 
-    /// <summary>
-    /// Decodes Chapter T (RFC 6295 §A.8). Returns bytes consumed (1) or -1.
-    /// </summary>
+    /// <summary>Decodes Chapter T. Delegates to <see cref="Journal.Chapters.ChapterTCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterT(ReadOnlySpan<byte> data, byte channel, List<byte[]> recovered)
-    {
-        if (data.IsEmpty) return -1;
-
-        byte pressure = (byte)(data[0] & 0x7F);
-        recovered.Add([(byte)(0xD0 | (channel & 0x0F)), pressure]);
-
-        return 1;
-    }
+        => Journal.Chapters.ChapterTCodec.DecodeStatic(data, channel, recovered);
 
     /// <summary>
     /// Decodes Chapter A (RFC 6295 §A.9): LEN = (count − 1) in 7 bits.
@@ -1048,66 +974,15 @@ internal sealed class SystemMidiState
     // Encoding
     // -----------------------------------------------------------------------
 
-    /// <summary>
-    /// Encodes Chapter F (System Common) — variable length (RFC 6295 §B.3).
-    ///
-    ///   Byte 0:  S | D(=0) | V | Q | F | X(=0) | P(=0) | C(=0)
-    ///     D=1 → MTC Quarter Frame data byte follows (1 byte)
-    ///     V=1 → Song Position Pointer follows (2 bytes: LSB, MSB)
-    ///     Q=1 → Song Select follows (1 byte)
-    /// </summary>
+    /// <summary>Encodes Chapter F. Delegates to <see cref="Journal.Chapters.ChapterFCodec"/>.</summary>
     public byte[] EncodeChapterF(bool isLast)
-    {
-        int size = 1
-            + (HasTimeCode    ? 1 : 0)
-            + (HasSongPosition ? 2 : 0)
-            + (HasSongSelect  ? 1 : 0);
-
-        var buf = new byte[size];
-        buf[0] = (byte)(
-            (isLast         ? 0x80 : 0) |
-            (HasTimeCode    ? 0x40 : 0) |  // D flag
-            (HasSongPosition ? 0x20 : 0) | // V flag
-            (HasSongSelect  ? 0x10 : 0));  // Q flag
-
-        int offset = 1;
-        if (HasTimeCode)    { buf[offset++] = TimeCode; }
-        if (HasSongPosition) { buf[offset++] = SongPositionLsb; buf[offset++] = SongPositionMsb; }
-        if (HasSongSelect)  { buf[offset++] = SongSelect; }
-
-        return buf;
-    }
+        => new Journal.Chapters.ChapterFCodec(this).Encode(isLast);
 
     // -----------------------------------------------------------------------
     // Decoding
     // -----------------------------------------------------------------------
 
-    /// <summary>
-    /// Decodes Chapter F and appends the recovered system-common messages
-    /// to <paramref name="recovered"/>.
-    /// Returns the number of bytes consumed, or -1 on error.
-    /// </summary>
+    /// <summary>Decodes Chapter F. Delegates to <see cref="Journal.Chapters.ChapterFCodec.DecodeStatic"/>.</summary>
     public static int DecodeChapterF(ReadOnlySpan<byte> data, List<byte[]> recovered)
-    {
-        if (data.IsEmpty) return -1;
-
-        byte header = data[0];
-        bool hasD = (header & 0x40) != 0;
-        bool hasV = (header & 0x20) != 0;
-        bool hasQ = (header & 0x10) != 0;
-
-        int required = 1
-            + (hasD ? 1 : 0)
-            + (hasV ? 2 : 0)
-            + (hasQ ? 1 : 0);
-
-        if (data.Length < required) return -1;
-
-        int offset = 1;
-        if (hasD) { recovered.Add([0xF1, (byte)(data[offset++] & 0x7F)]); }
-        if (hasV) { recovered.Add([0xF2, data[offset++], data[offset++]]); }
-        if (hasQ) { recovered.Add([0xF3, (byte)(data[offset++] & 0x7F)]); }
-
-        return required;
-    }
+        => Journal.Chapters.ChapterFCodec.DecodeStatic(data, recovered);
 }

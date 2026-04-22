@@ -89,6 +89,15 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // --- Sequence counter for outbound RTP packets ---
     private ushort sequenceNumber;
 
+    // Serialises SendMidiAsync. Without this, concurrent callers race the
+    // sequenceNumber increment (producing duplicate seq numbers) and the
+    // recovery-journal state (channelStates / systemMidiState / lastSysEx*)
+    // can be read by EncodeFullJournal mid-mutation by another thread,
+    // producing torn data or NREs. Concrete repro: an app firing many SysEx
+    // sends in parallel Task.Run blocks for LED feedback right after
+    // Connected.
+    private readonly SemaphoreSlim sendGate = new(1, 1);
+
     // --- Peer liveness tracking ---
     // UTC timestamp of the most-recent inbound packet (any kind). Updated in
     // ReceiveLoopAsync; checked in ClockSyncLoopAsync. Stays at default(DateTime)
@@ -406,6 +415,19 @@ public sealed class RtpMidiSession : IRtpMidiSession
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
+        await sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await SendMidiCoreAsync(midiBytes, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            sendGate.Release();
+        }
+    }
+
+    private async Task SendMidiCoreAsync(ReadOnlyMemory<byte> midiBytes, CancellationToken ct)
+    {
         // Update journal state BEFORE async operations — copy to array to avoid
         // holding a ReadOnlySpan across await points (not permitted in async methods).
         if (EnableRecoveryJournal && midiBytes.Length >= 1)

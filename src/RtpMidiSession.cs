@@ -884,12 +884,23 @@ public sealed class RtpMidiSession : IRtpMidiSession
             }
         }
         catch (OperationCanceledException) { }
-        catch (SocketException)
+        catch (ObjectDisposedException)
         {
-            // If the socket died while we were still connected (not a planned shutdown),
-            // trigger a clean disconnect so reconnect logic can kick in.
+            // Benign: concurrent shutdown closed the socket under us.
+        }
+        catch (Exception ex)
+        {
+            // Broad catch (previously SocketException only): any other fault
+            // would silently unwind the task and leave State stuck at
+            // Connected. The peer-liveness watchdog would eventually notice,
+            // but reacting to the immediate failure is crisper and matches
+            // ClockSyncLoopAsync's defensive pattern.
             if (State == SessionState.Connected)
+            {
+                if (TraceHook != null)
+                    TraceHook($"[{localName}] receive loop faulted: {ex.GetType().Name}: {ex.Message} -- disconnecting");
                 _ = DisconnectAsync();
+            }
         }
     }
 

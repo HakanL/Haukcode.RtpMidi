@@ -1197,9 +1197,22 @@ public sealed class RtpMidiSession : IRtpMidiSession
     // Reconnect loops
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Upper bound on the exponential-backoff delay applied by
+    /// <see cref="ConnectWithReconnectAsync"/> and
+    /// <see cref="ListenWithReconnectAsync"/> when the peer keeps rejecting
+    /// us (wrong IP, busy host, partitioned network). The delay starts at
+    /// the caller-supplied initial value and doubles after every failed
+    /// attempt, capped here so retries keep going forever but at a sane
+    /// rate. Resets to the initial value on every successful handshake.
+    /// </summary>
+    public static readonly TimeSpan MaxReconnectDelay = TimeSpan.FromSeconds(30);
+
     /// <inheritdoc/>
     public async Task ConnectWithReconnectAsync(IPEndPoint controlEndPoint, TimeSpan reconnectDelay, CancellationToken ct = default)
     {
+        var currentDelay = reconnectDelay;
+
         while (!ct.IsCancellationRequested)
         {
             // Subscribe before connecting so we cannot miss a rapid disconnect.
@@ -1208,9 +1221,12 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 .Where(s => s == SessionState.Idle)
                 .Subscribe(_ => sessionEndedTcs.TrySetResult());
 
+            bool handshakeSucceeded = false;
             try
             {
                 await ConnectAsync(controlEndPoint, ct);
+                handshakeSucceeded = true;
+                currentDelay       = reconnectDelay;    // reset backoff on success
                 // Wait until the session falls back to Idle (BY from remote, socket error, etc.)
                 await sessionEndedTcs.Task.WaitAsync(ct);
             }
@@ -1226,14 +1242,22 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
             if (ct.IsCancellationRequested) return;
 
-            try { await Task.Delay(reconnectDelay, ct); }
+            try { await Task.Delay(currentDelay, ct); }
             catch (OperationCanceledException) { return; }
+
+            // Only grow the delay when the handshake itself failed. A successful
+            // session that ended normally (peer BY / silence timeout / etc.)
+            // was already reset above, so we go back out at the initial cadence.
+            if (!handshakeSucceeded)
+                currentDelay = GrowBackoff(currentDelay);
         }
     }
 
     /// <inheritdoc/>
     public async Task ListenWithReconnectAsync(int controlPort, TimeSpan reconnectDelay, CancellationToken ct = default)
     {
+        var currentDelay = reconnectDelay;
+
         while (!ct.IsCancellationRequested)
         {
             var sessionEndedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1241,9 +1265,12 @@ public sealed class RtpMidiSession : IRtpMidiSession
                 .Where(s => s == SessionState.Idle)
                 .Subscribe(_ => sessionEndedTcs.TrySetResult());
 
+            bool handshakeSucceeded = false;
             try
             {
                 await ListenAsync(controlPort, ct);
+                handshakeSucceeded = true;
+                currentDelay       = reconnectDelay;
                 await sessionEndedTcs.Task.WaitAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1257,9 +1284,18 @@ public sealed class RtpMidiSession : IRtpMidiSession
 
             if (ct.IsCancellationRequested) return;
 
-            try { await Task.Delay(reconnectDelay, ct); }
+            try { await Task.Delay(currentDelay, ct); }
             catch (OperationCanceledException) { return; }
+
+            if (!handshakeSucceeded)
+                currentDelay = GrowBackoff(currentDelay);
         }
+    }
+
+    private static TimeSpan GrowBackoff(TimeSpan current)
+    {
+        var doubled = TimeSpan.FromMilliseconds(current.TotalMilliseconds * 2.0);
+        return doubled > MaxReconnectDelay ? MaxReconnectDelay : doubled;
     }
 
     // -------------------------------------------------------------------------
